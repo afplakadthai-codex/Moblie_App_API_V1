@@ -576,112 +576,46 @@ if (!function_exists('bvm_checkout_session_base_url')) {
     }
 }
 
+if (!function_exists('bvm_checkout_session_stripe_debug_log')) {
+    function bvm_checkout_session_stripe_debug_log(string $message): void
+    {
+        $publicRoot = bvm_checkout_session_public_root();
+       $logDir = $publicRoot . '/logs';
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0755, true);
+        }
+       @file_put_contents($logDir . '/mobile_checkout_stripe.log', '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+    }
+}		
+
+if (!function_exists('bvm_checkout_session_apply_url_placeholders')) {
+    function bvm_checkout_session_apply_url_placeholders(string $url, int $orderId, string $orderCode): string
+    {
+        return str_replace(
+            ['{ORDER_ID}', '{order_id}', '{ORDER_CODE}', '{order_code}'],
+            [(string) $orderId, (string) $orderId, $orderCode, $orderCode],
+            $url
+        );
+    }
+}
+
 if (!function_exists('bvm_checkout_session_boot_stripe')) {
     function bvm_checkout_session_boot_stripe(): bool
     {
-        $publicRoot = bvm_checkout_session_public_root();
-        $projectRoot = bvm_checkout_session_project_root();
-        $stripe_secret_key = $stripeSecretKey = $stripeSecret = null;
-        $stripe = $stripeConfig = [];
+        $configPath = bvm_checkout_session_public_root() . '/includes/stripe_config.php';
+        $exists = is_file($configPath);
+        bvm_checkout_session_stripe_debug_log('checked_path=' . $configPath . ' exists=' . ($exists ? 'yes' : 'no'));
 
-        $debug = static function (string $message) use ($publicRoot): void {
-            $logDir = $publicRoot . '/logs';
-            if (!is_dir($logDir)) {
-                @mkdir($logDir, 0755, true);
-            }
-            @file_put_contents($logDir . '/mobile_checkout_stripe.log', '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
-        };
-
-        $configCandidates = [
-            $publicRoot . '/includes/stripe_config.php',
-            $publicRoot . '/includes/stripe_bootstrap.php',
-            $publicRoot . '/config/stripe.php',
-            $publicRoot . '/config/stripe_config.php',
-            $publicRoot . '/private/stripe_env.php',
-            $projectRoot . '/private/stripe_env.php',			
-            $publicRoot . '/stripe_config.php',
-            $projectRoot . '/public_html/includes/stripe_config.php',
-            $projectRoot . '/public_html/includes/stripe_bootstrap.php',
-           $projectRoot . '/public_html/config/stripe.php',
-            $projectRoot . '/public_html/config/stripe_config.php',
-            $projectRoot . '/public_html/private/stripe_env.php',			
-            $projectRoot . '/public_html/stripe_config.php',
-        ];
-
-         foreach (array_values(array_unique($configCandidates)) as $file) {
-            $exists = is_file($file);
-            $debug('checked_path=' . $file . ' exists=' . ($exists ? 'yes' : 'no'));
-            if ($exists) {
-                /** @noinspection PhpIncludeInspection */
-                @include_once $file;
-            }
+         if ($exists) {
+            /** @noinspection PhpIncludeInspection */
+            @include_once $configPath;
         }
 
-        $autoloadCandidates = [
-            $publicRoot . '/vendor/autoload.php',
-            $projectRoot . '/vendor/autoload.php',
-            $projectRoot . '/public_html/vendor/autoload.php',
-        ];
-        foreach (array_values(array_unique($autoloadCandidates)) as $file) {
-             $exists = is_file($file);
-            $debug('checked_path=' . $file . ' exists=' . ($exists ? 'yes' : 'no'));
-            if ($exists) {
-                /** @noinspection PhpIncludeInspection */
-                @include_once $file;
-            }
-        }
+        $hasSecretFunction = function_exists('bv_stripe_secret_key');
+        $isReady = function_exists('bv_stripe_is_ready') && bv_stripe_is_ready();
+        bvm_checkout_session_stripe_debug_log('stripe_config_loaded=' . ($exists ? 'yes' : 'no') . ' secret_function=' . ($hasSecretFunction ? 'yes' : 'no') . ' ready=' . ($isReady ? 'yes' : 'no'));
 
-       $secret = null;
-        foreach (['STRIPE_SECRET_KEY', 'STRIPE_API_KEY', 'STRIPE_SECRET', 'STRIPE_SK', 'STRIPE_TEST_SECRET_KEY', 'STRIPE_LIVE_SECRET_KEY'] as $constant) {
-            if (defined($constant) && is_string(constant($constant)) && trim((string) constant($constant)) !== '') {
-                $secret = trim((string) constant($constant));
-                break;
-            }
-        }
-
-        foreach (['stripe_secret_key', 'stripeSecretKey', 'stripeSecret'] as $varName) {
-            if ($secret === null && isset($$varName) && is_string($$varName) && trim($$varName) !== '') {
-                $secret = trim($$varName);
-            }
-            if ($secret === null && isset($GLOBALS[$varName]) && is_string($GLOBALS[$varName]) && trim($GLOBALS[$varName]) !== '') {
-                $secret = trim($GLOBALS[$varName]);
-            }
-        }
-
-        foreach ([['stripe', 'secret_key'], ['stripeConfig', 'secret_key']] as $arrayRef) {
-            $arrayName = $arrayRef[0];
-            $keyName = $arrayRef[1];
-            $localConfig = ${$arrayName} ?? null;
-            if ($secret === null && is_array($localConfig) && isset($localConfig[$keyName]) && is_string($localConfig[$keyName]) && trim($localConfig[$keyName]) !== '') {
-                $secret = trim($localConfig[$keyName]);
-            }
-            if ($secret === null && isset($GLOBALS[$arrayName]) && is_array($GLOBALS[$arrayName]) && isset($GLOBALS[$arrayName][$keyName]) && is_string($GLOBALS[$arrayName][$keyName]) && trim($GLOBALS[$arrayName][$keyName]) !== '') {
-                $secret = trim($GLOBALS[$arrayName][$keyName]); 
-            }
-        }
-
-        $stripeClassExists = class_exists('\Stripe\Stripe');
-        $checkoutClassExists = class_exists('\Stripe\Checkout\Session');
-        $debug('stripe_class_exists=' . ($stripeClassExists ? 'yes' : 'no') . ' secret_found=' . ($secret !== null ? 'yes' : 'no'));
-
-        if ($stripeClassExists && method_exists('\Stripe\Stripe', 'getApiKey')) {
-            $existingKey = \Stripe\Stripe::getApiKey();
-            if (is_string($existingKey) && trim($existingKey) !== '') {
-                $debug('stripe_class_exists=yes secret_found=yes');
-                return true;
-            }
-        }
-
-        if ($stripeClassExists && $secret !== null && method_exists('\Stripe\Stripe', 'setApiKey')) { 
-            \Stripe\Stripe::setApiKey($secret);
-             return $checkoutClassExists || function_exists('stripe_client') || function_exists('bettavaro_stripe_client') || function_exists('bv_stripe_client');
-        }
-
-        if (function_exists('stripe_client') || function_exists('bettavaro_stripe_client') || function_exists('bv_stripe_client')) {
-            return true;
-        }
-
-        return false;
+        return $hasSecretFunction && $isReady;
     }
 }
 
@@ -689,115 +623,139 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
     function bvm_checkout_session_create_stripe_session(array $order, array $buyer): array
     {
         if (!bvm_checkout_session_boot_stripe()) {
-            bvm_checkout_session_error('stripe_config_missing', 'Stripe SDK or configuration is unavailable.', 500);
+             bvm_checkout_session_error('stripe_config_missing', 'Stripe configuration is unavailable.', 500);
+        }
+
+        if (!function_exists('curl_init')) {
+            bvm_checkout_session_stripe_debug_log('Stripe API unavailable: curl extension missing');
+            bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
+        }
+
+        $secretKey = trim((string) bv_stripe_secret_key());
+        if ($secretKey === '') {
+            bvm_checkout_session_stripe_debug_log('Stripe API unavailable: empty secret key from configuration');
+            bvm_checkout_session_error('stripe_config_missing', 'Stripe configuration is unavailable.', 500);
         }
 
         $orderId = (int) $order['id'];
         $orderCode = trim((string) ($order['order_code'] ?? ''));
-        $currency = strtolower((string) $order['currency']);
+        $currency = 'usd';
         $amount = bvm_checkout_session_money_to_stripe_amount($order['total'], (string) $order['currency']);
         $productName = $orderCode !== '' ? 'Bettavaro Order ' . $orderCode : 'Bettavaro Order ' . $orderId;
-        $baseUrl = bvm_checkout_session_base_url();
 
-        $successUrl = $baseUrl . '/payment-success.php?order_id=' . rawurlencode((string) $orderId) . '&source=mobile&session_id={CHECKOUT_SESSION_ID}';
-        $cancelUrl = $baseUrl . '/payment-cancel.php?order_id=' . rawurlencode((string) $orderId) . '&source=mobile';
 
-        if (defined('MOBILE_STRIPE_SUCCESS_URL') && is_string(MOBILE_STRIPE_SUCCESS_URL) && MOBILE_STRIPE_SUCCESS_URL !== '') {
-            $successUrl = str_replace(['{ORDER_ID}', '{order_id}'], (string) $orderId, MOBILE_STRIPE_SUCCESS_URL);
-        } elseif (defined('STRIPE_SUCCESS_URL') && is_string(STRIPE_SUCCESS_URL) && STRIPE_SUCCESS_URL !== '') {
-            $successUrl = str_replace(['{ORDER_ID}', '{order_id}'], (string) $orderId, STRIPE_SUCCESS_URL);
-            if (strpos($successUrl, '{CHECKOUT_SESSION_ID}') === false) {
-                $successUrl .= (strpos($successUrl, '?') === false ? '?' : '&') . 'session_id={CHECKOUT_SESSION_ID}';
-            }
+        $successUrl = function_exists('bv_stripe_success_url') ? trim((string) bv_stripe_success_url()) : '';
+        $cancelUrl = function_exists('bv_stripe_cancel_url') ? trim((string) bv_stripe_cancel_url()) : '';
+
+        if ($successUrl === '') {
+            $successUrl = bvm_checkout_session_base_url() . '/payment-success.php?order_id=' . rawurlencode((string) $orderId) . '&source=mobile&session_id={CHECKOUT_SESSION_ID}';
+        }
+        if ($cancelUrl === '') {
+            $cancelUrl = bvm_checkout_session_base_url() . '/payment-cancel.php?order_id=' . rawurlencode((string) $orderId) . '&source=mobile';
         }
 
-        if (defined('MOBILE_STRIPE_CANCEL_URL') && is_string(MOBILE_STRIPE_CANCEL_URL) && MOBILE_STRIPE_CANCEL_URL !== '') {
-            $cancelUrl = str_replace(['{ORDER_ID}', '{order_id}'], (string) $orderId, MOBILE_STRIPE_CANCEL_URL);
-        } elseif (defined('STRIPE_CANCEL_URL') && is_string(STRIPE_CANCEL_URL) && STRIPE_CANCEL_URL !== '') {
-            $cancelUrl = str_replace(['{ORDER_ID}', '{order_id}'], (string) $orderId, STRIPE_CANCEL_URL);
+        $successUrl = bvm_checkout_session_apply_url_placeholders($successUrl, $orderId, $orderCode);
+        if (strpos($successUrl, '{CHECKOUT_SESSION_ID}') === false) {
+            $successUrl .= (strpos($successUrl, '?') === false ? '?' : '&') . 'session_id={CHECKOUT_SESSION_ID}';
         }
+        $cancelUrl = bvm_checkout_session_apply_url_placeholders($cancelUrl, $orderId, $orderCode);
 
-        $params = [
-            'payment_method_types' => ['card'],
-            'mode'                 => 'payment',
-            'success_url'          => $successUrl,
-            'cancel_url'           => $cancelUrl,
-            'line_items'           => [[
-                'price_data' => [
-                    'currency'     => $currency,
-                    'product_data' => [
-                        'name' => $productName,
-                    ],
-                    'unit_amount'  => $amount,
-                ],
-                'quantity'   => 1,
-            ]],
-            'metadata'             => [
-                'order_id'    => (string) $orderId,
-                'order_code'  => $orderCode,
-                'user_id'     => (string) $buyer['id'],
-                'source'      => 'mobile',
-                'integration' => 'mobile_api_v1',
-            ],
-            'client_reference_id'  => (string) $orderId,
+        $payload = [
+            'mode' => 'payment',
+            'success_url' => $successUrl,
+            'cancel_url' => $cancelUrl,
+            'payment_method_types[]' => 'card',
+            'line_items[0][price_data][currency]' => $currency,
+            'line_items[0][price_data][product_data][name]' => $productName,
+            'line_items[0][price_data][unit_amount]' => $amount,
+            'line_items[0][quantity]' => 1,
+            'metadata[order_id]' => (string) $orderId,
+            'metadata[order_code]' => $orderCode,
+            'metadata[user_id]' => (string) $buyer['id'],
+            'metadata[source]' => 'mobile',
+            'metadata[integration]' => 'mobile_api_v1',
+            'client_reference_id' => (string) $orderId,
         ];
 
         if (!empty($buyer['email']) && filter_var($buyer['email'], FILTER_VALIDATE_EMAIL)) {
-            $params['customer_email'] = (string) $buyer['email'];
+            $payload['customer_email'] = (string) $buyer['email'];
         }
 
         $updated = preg_replace('/[^0-9A-Za-z_\-]/', '', (string) ($order['updated_at'] ?? ''));
         if ($updated === '') {
             $updated = (string) time();
         }
-        $opts = ['idempotency_key' => 'mobile_checkout_order_' . $orderId . '_' . $updated];
+      $idempotencyKey = 'mobile_checkout_order_' . $orderId . '_' . $updated;
 
-        try {
-            if (function_exists('stripe_client')) {
-                $client = stripe_client();
-                if (is_object($client) && isset($client->checkout) && isset($client->checkout->sessions)) {
-                    $session = $client->checkout->sessions->create($params, $opts);
-                } else {
-                    $session = \Stripe\Checkout\Session::create($params, $opts);
-                }
-            } elseif (function_exists('bettavaro_stripe_client')) {
-                $client = bettavaro_stripe_client();
-                if (is_object($client) && isset($client->checkout) && isset($client->checkout->sessions)) {
-                    $session = $client->checkout->sessions->create($params, $opts);
-                } else {
-                    $session = \Stripe\Checkout\Session::create($params, $opts);
-                }
-            } elseif (function_exists('bv_stripe_client')) {
-                $client = bv_stripe_client();
-                if (is_object($client) && isset($client->checkout) && isset($client->checkout->sessions)) {
-                    $session = $client->checkout->sessions->create($params, $opts);
-                } else {
-                    $session = \Stripe\Checkout\Session::create($params, $opts);
-                }
-            } else {
-                $session = \Stripe\Checkout\Session::create($params, $opts);
-            }
-        } catch (Throwable $e) {
-            error_log('[BV Mobile Checkout Session] Stripe session failed: ' . $e->getMessage());
+        $ch = curl_init('https://api.stripe.com/v1/checkout/sessions');
+        if ($ch === false) {
+            bvm_checkout_session_stripe_debug_log('Stripe API unavailable: curl_init failed');
             bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
         }
 
-        $sessionId = '';
-        $checkoutUrl = '';
-        if (is_object($session)) {
-            $sessionId = (string) ($session->id ?? '');
-            $checkoutUrl = (string) ($session->url ?? '');
-        } elseif (is_array($session)) {
-            $sessionId = (string) ($session['id'] ?? '');
-            $checkoutUrl = (string) ($session['url'] ?? '');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER => false,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $secretKey,
+                'Content-Type: application/x-www-form-urlencoded',
+                'Idempotency-Key: ' . $idempotencyKey,
+            ],
+            CURLOPT_POSTFIELDS => http_build_query($payload, '', '&', PHP_QUERY_RFC3986),
+        ]);
+
+        $rawResponse = curl_exec($ch);
+        $curlError = curl_error($ch);
+        $httpStatus = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $decoded = null;
+        if (is_string($rawResponse) && $rawResponse !== '') {
+            $decoded = json_decode($rawResponse, true);
+            if (!is_array($decoded)) {
+                $decoded = null;
+            }
         }
+
+        $stripeErrorType = '';
+        $stripeErrorMessage = '';
+        if (isset($decoded['error']) && is_array($decoded['error'])) {
+            $stripeErrorType = isset($decoded['error']['type']) ? (string) $decoded['error']['type'] : '';
+            $stripeErrorMessage = isset($decoded['error']['message']) ? (string) $decoded['error']['message'] : '';
+        }
+		
+        if ($rawResponse === false || $httpStatus < 200 || $httpStatus >= 300 || !is_array($decoded)) {
+            $message = 'Stripe API session create failed: http_status=' . $httpStatus;
+            if ($stripeErrorType !== '') {
+                $message .= ' error_type=' . $stripeErrorType;
+            }
+            if ($stripeErrorMessage !== '') {
+                $message .= ' error_message=' . $stripeErrorMessage;
+            }
+            if ($curlError !== '') {
+                $message .= ' curl_error=' . $curlError;
+            }
+            bvm_checkout_session_stripe_debug_log($message);
+            bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
+        }
+
+        $sessionId = isset($decoded['id']) ? (string) $decoded['id'] : '';
+        $checkoutUrl = isset($decoded['url']) ? (string) $decoded['url'] : '';
+		
 
         if ($sessionId === '' || $checkoutUrl === '') {
+            bvm_checkout_session_stripe_debug_log('Stripe API session response incomplete: http_status=' . $httpStatus);			
             bvm_checkout_session_error('stripe_session_failed', 'Stripe Checkout Session response was incomplete.', 502);
         }
+        bvm_checkout_session_stripe_debug_log('Stripe API session create succeeded: http_status=' . $httpStatus);		
 
         return [
-            'session_id'   => $sessionId,
+            'id' => $sessionId,
+            'url' => $checkoutUrl,
+            'session_id' => $sessionId,
             'checkout_url' => $checkoutUrl,
         ];
     }
