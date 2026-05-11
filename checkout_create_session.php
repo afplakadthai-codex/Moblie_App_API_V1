@@ -743,20 +743,23 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
         }
 
         $sessionId = isset($response['id']) ? (string) $response['id'] : '';
-        $checkoutUrl = isset($response['url']) ? (string) $response['url'] : '';
-        $responseHasUrl = $checkoutUrl !== '';
-        $responseDebug = 'Stripe API session response: response_has_url=' . ($responseHasUrl ? 'yes' : 'no')
+        $checkoutUrl = trim((string)($response['url'] ?? ''));
+        $responseDebug = 'Stripe API session response: response_has_url=' . ($checkoutUrl !== '' ? 'yes' : 'no')
             . ' session_id=' . ($sessionId !== '' ? $sessionId : 'missing')
             . ' http_status=' . $httpStatus;
 
-        if ($sessionId === '' || !$responseHasUrl) {
+         if ($sessionId === '') {
             bvm_checkout_session_stripe_debug_log($responseDebug);
             bvm_checkout_session_error('stripe_session_failed', 'Stripe Checkout Session response was incomplete.', 502);
         }
+        if ($checkoutUrl === '') {
+            bvm_checkout_session_stripe_debug_log($responseDebug);
+            throw new RuntimeException('Stripe checkout session URL is missing.');
+        }		
         bvm_checkout_session_stripe_debug_log($responseDebug);
 
         return [
-            'session_id' => $sessionId,
+            'session_id' => $response['id'],
             'checkout_url' => $checkoutUrl,
         ];
     }
