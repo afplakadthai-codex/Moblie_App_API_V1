@@ -586,7 +586,32 @@ if (!function_exists('bvm_checkout_session_stripe_debug_log')) {
         }
        @file_put_contents($logDir . '/mobile_checkout_stripe.log', '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
     }
-}		
+}
+
+if (!function_exists('bvm_checkout_session_stripe_response_log')) {
+    function bvm_checkout_session_stripe_response_log(int $httpStatus, $rawResponse, ?array $response): void
+    {
+        $publicRoot = bvm_checkout_session_public_root();
+        $logDir = $publicRoot . '/logs';
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0755, true);
+        }
+
+        $responseJson = is_string($rawResponse) ? $rawResponse : '';
+        $hasUrl = is_array($response) && isset($response['url']) && trim((string) $response['url']) !== '';
+        $hasId = is_array($response) && isset($response['id']) && trim((string) $response['id']) !== '';
+
+        $entry = '[' . date('Y-m-d H:i:s') . ']'
+            . ' http_status=' . $httpStatus
+            . ' response_has_url=' . ($hasUrl ? 'yes' : 'no')
+            . ' response_has_id=' . ($hasId ? 'yes' : 'no')
+            . ' response_json=' . $responseJson
+            . PHP_EOL;
+
+        @file_put_contents($logDir . '/mobile_checkout_stripe_response.log', $entry, FILE_APPEND | LOCK_EX);
+    }
+}
+		
 
 if (!function_exists('bvm_checkout_session_apply_url_placeholders')) {
     function bvm_checkout_session_apply_url_placeholders(string $url, int $orderId, string $orderCode): string
@@ -719,6 +744,7 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
                 $response = null;
             }
         }
+        bvm_checkout_session_stripe_response_log($httpStatus, $rawResponse, $response);		
 
         $stripeErrorType = '';
         $stripeErrorMessage = '';
@@ -742,24 +768,21 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
             bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
         }
 
-        $sessionId = isset($response['id']) ? (string) $response['id'] : '';
-        $checkoutUrl = trim((string)($response['url'] ?? ''));
+         $sessionId = isset($response['id']) ? trim((string) $response['id']) : '';
+        $checkoutUrl = trim((string) ($response['url'] ?? ''));
         $responseDebug = 'Stripe API session response: response_has_url=' . ($checkoutUrl !== '' ? 'yes' : 'no')
-            . ' session_id=' . ($sessionId !== '' ? $sessionId : 'missing')
+            . ' response_has_id=' . ($sessionId !== '' ? 'yes' : 'no')
             . ' http_status=' . $httpStatus;
 
-         if ($sessionId === '') {
+        if ($checkoutUrl === '') {
             bvm_checkout_session_stripe_debug_log($responseDebug);
             bvm_checkout_session_error('stripe_session_failed', 'Stripe Checkout Session response was incomplete.', 502);
         }
-        if ($checkoutUrl === '') {
-            bvm_checkout_session_stripe_debug_log($responseDebug);
-            throw new RuntimeException('Stripe checkout session URL is missing.');
-        }		
+ 
         bvm_checkout_session_stripe_debug_log($responseDebug);
 
         return [
-            'session_id' => $response['id'],
+            'session_id' => $sessionId, 
             'checkout_url' => $checkoutUrl,
         ];
     }
