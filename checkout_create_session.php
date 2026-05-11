@@ -581,17 +581,37 @@ if (!function_exists('bvm_checkout_session_boot_stripe')) {
     {
         $publicRoot = bvm_checkout_session_public_root();
         $projectRoot = bvm_checkout_session_project_root();
-        $candidates = [
+        $stripe_secret_key = $stripeSecretKey = $stripeSecret = null;
+        $stripe = $stripeConfig = [];
+
+        $debug = static function (string $message) use ($publicRoot): void {
+            $logDir = $publicRoot . '/logs';
+            if (!is_dir($logDir)) {
+                @mkdir($logDir, 0755, true);
+            }
+            @file_put_contents($logDir . '/mobile_checkout_stripe.log', '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+        };
+
+        $configCandidates = [
             $publicRoot . '/includes/stripe_config.php',
             $publicRoot . '/includes/stripe_bootstrap.php',
+            $publicRoot . '/config/stripe.php',
+            $publicRoot . '/config/stripe_config.php',
+            $publicRoot . '/private/stripe_env.php',
+            $projectRoot . '/private/stripe_env.php',			
             $publicRoot . '/stripe_config.php',
             $projectRoot . '/public_html/includes/stripe_config.php',
             $projectRoot . '/public_html/includes/stripe_bootstrap.php',
+           $projectRoot . '/public_html/config/stripe.php',
+            $projectRoot . '/public_html/config/stripe_config.php',
+            $projectRoot . '/public_html/private/stripe_env.php',			
             $projectRoot . '/public_html/stripe_config.php',
         ];
 
-        foreach (array_values(array_unique($candidates)) as $file) {
-            if (is_file($file)) {
+         foreach (array_values(array_unique($configCandidates)) as $file) {
+            $exists = is_file($file);
+            $debug('checked_path=' . $file . ' exists=' . ($exists ? 'yes' : 'no'));
+            if ($exists) {
                 /** @noinspection PhpIncludeInspection */
                 @include_once $file;
             }
@@ -603,40 +623,58 @@ if (!function_exists('bvm_checkout_session_boot_stripe')) {
             $projectRoot . '/public_html/vendor/autoload.php',
         ];
         foreach (array_values(array_unique($autoloadCandidates)) as $file) {
-            if (is_file($file)) {
+             $exists = is_file($file);
+            $debug('checked_path=' . $file . ' exists=' . ($exists ? 'yes' : 'no'));
+            if ($exists) {
                 /** @noinspection PhpIncludeInspection */
                 @include_once $file;
             }
         }
 
-        if (!class_exists('\Stripe\Stripe') || !class_exists('\Stripe\Checkout\Session')) {
-            return false;
-        }
-
-        if (method_exists('\Stripe\Stripe', 'getApiKey')) {
-            $existingKey = \Stripe\Stripe::getApiKey();
-            if (is_string($existingKey) && trim($existingKey) !== '') {
-                return true;
-            }
-        }
-
-        $secret = null;
-        foreach (['STRIPE_SECRET_KEY', 'STRIPE_API_KEY', 'STRIPE_SK', 'STRIPE_SECRET'] as $constant) {
+       $secret = null;
+        foreach (['STRIPE_SECRET_KEY', 'STRIPE_API_KEY', 'STRIPE_SECRET', 'STRIPE_SK', 'STRIPE_TEST_SECRET_KEY', 'STRIPE_LIVE_SECRET_KEY'] as $constant) {
             if (defined($constant) && is_string(constant($constant)) && trim((string) constant($constant)) !== '') {
                 $secret = trim((string) constant($constant));
                 break;
             }
         }
 
-        foreach (['stripe_secret_key', 'stripeSecretKey', 'STRIPE_SECRET_KEY', 'stripeApiKey'] as $global) {
-            if ($secret === null && isset($GLOBALS[$global]) && is_string($GLOBALS[$global]) && trim($GLOBALS[$global]) !== '') {
-                $secret = trim($GLOBALS[$global]);
+        foreach (['stripe_secret_key', 'stripeSecretKey', 'stripeSecret'] as $varName) {
+            if ($secret === null && isset($$varName) && is_string($$varName) && trim($$varName) !== '') {
+                $secret = trim($$varName);
+            }
+            if ($secret === null && isset($GLOBALS[$varName]) && is_string($GLOBALS[$varName]) && trim($GLOBALS[$varName]) !== '') {
+                $secret = trim($GLOBALS[$varName]);
             }
         }
 
-        if ($secret !== null && method_exists('\Stripe\Stripe', 'setApiKey')) {
+        foreach ([['stripe', 'secret_key'], ['stripeConfig', 'secret_key']] as $arrayRef) {
+            $arrayName = $arrayRef[0];
+            $keyName = $arrayRef[1];
+            $localConfig = ${$arrayName} ?? null;
+            if ($secret === null && is_array($localConfig) && isset($localConfig[$keyName]) && is_string($localConfig[$keyName]) && trim($localConfig[$keyName]) !== '') {
+                $secret = trim($localConfig[$keyName]);
+            }
+            if ($secret === null && isset($GLOBALS[$arrayName]) && is_array($GLOBALS[$arrayName]) && isset($GLOBALS[$arrayName][$keyName]) && is_string($GLOBALS[$arrayName][$keyName]) && trim($GLOBALS[$arrayName][$keyName]) !== '') {
+                $secret = trim($GLOBALS[$arrayName][$keyName]); 
+            }
+        }
+
+        $stripeClassExists = class_exists('\Stripe\Stripe');
+        $checkoutClassExists = class_exists('\Stripe\Checkout\Session');
+        $debug('stripe_class_exists=' . ($stripeClassExists ? 'yes' : 'no') . ' secret_found=' . ($secret !== null ? 'yes' : 'no'));
+
+        if ($stripeClassExists && method_exists('\Stripe\Stripe', 'getApiKey')) {
+            $existingKey = \Stripe\Stripe::getApiKey();
+            if (is_string($existingKey) && trim($existingKey) !== '') {
+                $debug('stripe_class_exists=yes secret_found=yes');
+                return true;
+            }
+        }
+
+        if ($stripeClassExists && $secret !== null && method_exists('\Stripe\Stripe', 'setApiKey')) { 
             \Stripe\Stripe::setApiKey($secret);
-            return true;
+             return $checkoutClassExists || function_exists('stripe_client') || function_exists('bettavaro_stripe_client') || function_exists('bv_stripe_client');
         }
 
         if (function_exists('stripe_client') || function_exists('bettavaro_stripe_client') || function_exists('bv_stripe_client')) {
