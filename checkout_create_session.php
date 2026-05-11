@@ -712,22 +712,22 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
         $httpStatus = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        $decoded = null;
+         $response = null;
         if (is_string($rawResponse) && $rawResponse !== '') {
-            $decoded = json_decode($rawResponse, true);
-            if (!is_array($decoded)) {
-                $decoded = null;
+            $response = json_decode($rawResponse, true);
+            if (!is_array($response)) {
+                $response = null;
             }
         }
 
         $stripeErrorType = '';
         $stripeErrorMessage = '';
-        if (isset($decoded['error']) && is_array($decoded['error'])) {
-            $stripeErrorType = isset($decoded['error']['type']) ? (string) $decoded['error']['type'] : '';
-            $stripeErrorMessage = isset($decoded['error']['message']) ? (string) $decoded['error']['message'] : '';
+        if (isset($response['error']) && is_array($response['error'])) {
+            $stripeErrorType = isset($response['error']['type']) ? (string) $response['error']['type'] : '';
+            $stripeErrorMessage = isset($response['error']['message']) ? (string) $response['error']['message'] : '';
         }
-		
-        if ($rawResponse === false || $httpStatus < 200 || $httpStatus >= 300 || !is_array($decoded)) {
+
+        if ($rawResponse === false || $httpStatus < 200 || $httpStatus >= 300 || !is_array($response)) {
             $message = 'Stripe API session create failed: http_status=' . $httpStatus;
             if ($stripeErrorType !== '') {
                 $message .= ' error_type=' . $stripeErrorType;
@@ -742,19 +742,20 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
             bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
         }
 
-        $sessionId = isset($decoded['id']) ? (string) $decoded['id'] : '';
-        $checkoutUrl = isset($decoded['url']) ? (string) $decoded['url'] : '';
-		
+        $sessionId = isset($response['id']) ? (string) $response['id'] : '';
+        $checkoutUrl = isset($response['url']) ? (string) $response['url'] : '';
+        $responseHasUrl = $checkoutUrl !== '';
+        $responseDebug = 'Stripe API session response: response_has_url=' . ($responseHasUrl ? 'yes' : 'no')
+            . ' session_id=' . ($sessionId !== '' ? $sessionId : 'missing')
+            . ' http_status=' . $httpStatus;
 
-        if ($sessionId === '' || $checkoutUrl === '') {
-            bvm_checkout_session_stripe_debug_log('Stripe API session response incomplete: http_status=' . $httpStatus);			
+        if ($sessionId === '' || !$responseHasUrl) {
+            bvm_checkout_session_stripe_debug_log($responseDebug);
             bvm_checkout_session_error('stripe_session_failed', 'Stripe Checkout Session response was incomplete.', 502);
         }
-        bvm_checkout_session_stripe_debug_log('Stripe API session create succeeded: http_status=' . $httpStatus);		
+        bvm_checkout_session_stripe_debug_log($responseDebug);
 
         return [
-            'id' => $sessionId,
-            'url' => $checkoutUrl,
             'session_id' => $sessionId,
             'checkout_url' => $checkoutUrl,
         ];
