@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 ini_set('display_errors', '0');
+ini_set('display_startup_errors', '0');
 error_reporting(E_ALL);
 
 header('Content-Type: application/json; charset=UTF-8');
@@ -26,6 +27,10 @@ function mobile_json($statusCode, $payload): void
     }
     $payload['meta']['api_version'] = 'mobile-v1';
     $payload['meta']['generated_at'] = mobile_now();
+	
+    while (ob_get_level() > 0) {
+        @ob_end_clean();
+    }
 
     echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
     exit;
@@ -184,7 +189,22 @@ function mobile_actual_col(PDO $pdo, string $table, array $candidates): ?string
 
 function mobile_bearer_token(): string
 {
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+   $header = '';
+
+    if (function_exists('getallheaders')) {
+        $headers = getallheaders();
+        foreach ($headers as $name => $value) {
+            if (strcasecmp((string) $name, 'Authorization') === 0) {
+                $header = (string) $value;
+                break;
+            }
+        }
+    }
+
+    if ($header === '') {
+        $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    }
+
     if ($header === '' && function_exists('apache_request_headers')) {
         $headers = apache_request_headers();
         foreach ($headers as $name => $value) {
@@ -250,7 +270,8 @@ function mobile_normalize_status($status): string
 {
     $status = strtolower(trim((string) $status));
     $status = str_replace(['-', ' '], '_', $status);
-    return preg_replace('/[^a-z0-9_]/', '', $status) ?? '';
+    $clean = preg_replace('/[^a-z0-9_]/', '', $status) ?? '';
+    return $clean !== '' ? $clean : 'unknown';
 }
 
 function mobile_resolve_asset_url(?string $path): string
@@ -469,9 +490,9 @@ function mobile_order_refund_summary(PDO $pdo, int $orderId): array
 
     $cols = mobile_columns($pdo, 'order_refunds');
     $statusCol = mobile_actual_col($pdo, 'order_refunds', ['status', 'refund_status']);
-    $requestedCol = mobile_actual_col($pdo, 'order_refunds', ['requested_refund_amount']);
-    $approvedCol = mobile_actual_col($pdo, 'order_refunds', ['approved_refund_amount']);
-    $actualCol = mobile_actual_col($pdo, 'order_refunds', ['actual_refunded_amount']);
+    $requestedCol = mobile_actual_col($pdo, 'order_refunds', ['requested_refund_amount', 'requested_amount']);
+    $approvedCol = mobile_actual_col($pdo, 'order_refunds', ['approved_refund_amount', 'approved_amount']);
+    $actualCol = mobile_actual_col($pdo, 'order_refunds', ['actual_refunded_amount', 'actual_refund_amount', 'refunded_amount']); 
 
     $select = [
         $statusCol === null ? "'' AS latest_status" : mobile_identifier($statusCol) . ' AS latest_status',
