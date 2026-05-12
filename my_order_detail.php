@@ -17,11 +17,30 @@ const MOBILE_API_VERSION = 'mobile-v1';
 
 class MobileClientSafeException extends RuntimeException
 {
+    private int $statusCode;
+    private string $errorCode;
+
+    public function __construct(string $message, int $statusCode = 400, string $errorCode = 'bad_request')
+    {
+        parent::__construct($message);
+        $this->statusCode = $statusCode;
+        $this->errorCode = $errorCode;
+    }
+
+    public function statusCode(): int
+    {
+        return $this->statusCode;
+    }
+
+    public function errorCode(): string
+    {
+        return $this->errorCode;
+    }
 }
 
 function mobile_now(): string
 {
-    return gmdate('Y-m-d H:i:s');
+    return date('Y-m-d H:i:s');
 }
 
 function mobile_json($statusCode, $payload): void
@@ -153,7 +172,11 @@ function mobile_db(): PDO
 
         foreach (['mysqli', 'link'] as $name) {
             if (($loaded[$name] ?? null) instanceof mysqli || (isset($GLOBALS[$name]) && $GLOBALS[$name] instanceof mysqli)) {
-                throw new MobileClientSafeException('This mobile endpoint requires a PDO database connection; mysqli-only bootstraps are not supported.');
+                throw new MobileClientSafeException(
+                    'This mobile endpoint requires a PDO database connection; mysqli-only bootstraps are not supported.',
+                    500,
+                    'server_error'
+                );
             }
         }
 
@@ -737,7 +760,7 @@ try {
     ]);
 } catch (MobileClientSafeException $e) {
     mobile_log($e->getMessage());
-    mobile_error('server_error', $e->getMessage(), 500);
+    mobile_error($e->errorCode(), $e->getMessage(), $e->statusCode());
 } catch (Throwable $e) {
     mobile_log($e->getMessage());
     mobile_error('server_error', 'Unable to load order detail at this time.', 500);
