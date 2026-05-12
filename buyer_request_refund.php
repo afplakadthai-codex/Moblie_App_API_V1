@@ -43,6 +43,14 @@ function bv_mobile_error(string $code, string $message, int $statusCode): void
 
 function bv_mobile_log(string $message): void
 {
+    $line = '[' . date('Y-m-d H:i:s') . '] [BV Mobile Buyer Request Refund] ' . $message . PHP_EOL;
+
+    $logDir = dirname(__DIR__, 3) . '/logs';
+    if (!is_dir($logDir)) {
+        @mkdir($logDir, 0755, true);
+    }
+
+    @file_put_contents($logDir . '/buyer_request_refund.log', $line, FILE_APPEND | LOCK_EX);
     error_log('[BV Mobile Buyer Request Refund] ' . $message);
 }
 
@@ -685,20 +693,58 @@ function bv_mobile_create_refund_request(PDO $pdo, array $buyer, array $order, a
     }
 }
 
-function bv_mobile_try_queue_refund_notification(array $refund): void
+function bv_mobile_try_queue_refund_notification(array $payload, string $event = 'request'): void
 {
-    foreach (['bv_refund_notifications_queue_request_created', 'bv_refund_notification_request_created', 'bv_order_refund_queue_notification'] as $function) {
-        if (!function_exists($function)) {
+    // Accepted event names (must match order_refund.php exactly):
+    //   'request'   — refund submitted by buyer
+    //   'completed' — refund approved and processed
+    $refundId = (int) ($payload['refund']['id'] ?? $payload['refund_id'] ?? $payload['id'] ?? 0);
+
+    if ($refundId <= 0) {
+        bv_mobile_log('Refund notification skipped: missing refund id.');
+        return;
+    }
+
+    // Preferred core helper.
+    // Current core signature expects: bv_refund_queue_notifications(int $refundId, string $event)
+    if (function_exists('bv_refund_queue_notifications')) {
+        try {
+            bv_refund_queue_notifications($refundId, $event);
+            bv_mobile_log('Refund notification queued: refund_id=' . $refundId . ', event=' . $event);
+            return;
+        } catch (TypeError $e) {
+            bv_mobile_log('Refund notification core signature mismatch: ' . $e->getMessage());
+            // Continue to safe fallback attempts below.
+        } catch (ArgumentCountError $e) {
+            bv_mobile_log('Refund notification core argument mismatch: ' . $e->getMessage());
+            // Continue to safe fallback attempts below.
+        } catch (Throwable $e) {
+            bv_mobile_log('Refund notification failed: ' . $e->getMessage());
+            return;
+        }
+    }
+
+    // Legacy helper names, if any older notification layer exists.
+    foreach ([
+        'bv_refund_notifications_queue_request_created',
+        'bv_refund_notification_request_created',
+        'bv_order_refund_queue_notification',
+    ] as $fn) {
+        if (!function_exists($fn)) {
             continue;
         }
 
         try {
-            $function($refund);
+            $fn($payload);
+            bv_mobile_log('Refund notification queued via legacy helper: ' . $fn . ', refund_id=' . $refundId);
+            return;
         } catch (Throwable $e) {
-            bv_mobile_log('Refund notification failed: ' . $e->getMessage());
+            bv_mobile_log('Refund notification failed via ' . $fn . ': ' . $e->getMessage());
+            return;
         }
-        return;
     }
+
+    bv_mobile_log('Refund notification helper not found. refund_id=' . $refundId . ', event=' . $event);
 }
 
 try {
