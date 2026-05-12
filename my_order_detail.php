@@ -394,8 +394,20 @@ function mobile_resolve_asset_url(?string $path): string
     return '/' . ltrim($path, '/');
 }
 
-function mobile_order_shipping_summary(array $items): array
+function mobile_order_shipping_summary(array $items, string $orderStatus = '', string $paymentStatus = ''): array
 {
+    $orderStatus = strtolower(trim($orderStatus));
+    $paymentStatus = strtolower(trim($paymentStatus));
+
+    if ($orderStatus === 'pending_payment' || in_array($paymentStatus, ['pending_payment', 'unpaid', 'pending'], true)) {
+        return [
+            'key' => 'awaiting_payment',
+            'label' => 'Awaiting Payment',
+            'message' => 'Waiting for payment confirmation before shipping.',
+            'tracking_numbers' => [],
+        ];
+    }
+	
     if ($items === []) {
         return [
             'key' => 'unknown',
@@ -753,7 +765,7 @@ try {
                 'paid_at' => $orderRow['paid_at'] !== null ? (string) $orderRow['paid_at'] : '',
                 'updated_at' => $orderRow['updated_at'] !== null ? (string) $orderRow['updated_at'] : '',
             ],
-            'shipping' => mobile_order_shipping_summary($items),
+            'shipping' => mobile_order_shipping_summary($items, trim((string) ($orderRow['status'] ?? '')), trim((string) ($orderRow['payment_status'] ?? ''))),
             'items' => $items,
             'refunds' => $refunds,
         ],
