@@ -576,55 +576,9 @@ if (!function_exists('bvm_checkout_session_base_url')) {
     }
 }
 
-if (!function_exists('bvm_checkout_session_stripe_debug_enabled')) {
-    function bvm_checkout_session_stripe_debug_enabled(): bool
-    {
-        return defined('BVM_CHECKOUT_SESSION_STRIPE_DEBUG') && BVM_CHECKOUT_SESSION_STRIPE_DEBUG === true;
-    }
-}
 
-if (!function_exists('bvm_checkout_session_mask_stripe_session_id')) {
-    function bvm_checkout_session_mask_stripe_session_id(?string $sessionId): string
-    {
-        $sessionId = trim((string) $sessionId);
-        if ($sessionId === '') {
-            return '';
-        }
 
-        if (strlen($sessionId) <= 12) {
-            return substr($sessionId, 0, 4) . '...';
-        }
 
-        return substr($sessionId, 0, 8) . '...' . substr($sessionId, -4);
-    }
-}
-
-if (!function_exists('bvm_checkout_session_stripe_error_log')) {
-    function bvm_checkout_session_stripe_error_log(
-        int $orderId,
-        int $httpStatus,
-        ?string $stripeSessionId,
-        string $errorCode,
-        string $errorMessage
-    ): void {
-        $entry = [
-            'generated_at' => date('Y-m-d H:i:s'),
-            'order_id' => $orderId,
-            'http_status' => $httpStatus,
-            'stripe_session_id' => bvm_checkout_session_mask_stripe_session_id($stripeSessionId),
-            'error' => [
-                'code' => $errorCode,
-                'message' => $errorMessage,
-            ],
-        ];
-
-        $encoded = json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if (is_string($encoded)) {
-            error_log('[BV Mobile Checkout Session] Stripe error: ' . $encoded);
-        } 
-    }
-}
-	
 
 if (!function_exists('bvm_checkout_session_apply_url_placeholders')) {
     function bvm_checkout_session_apply_url_placeholders(string $url, int $orderId, string $orderCode): string
@@ -643,15 +597,13 @@ if (!function_exists('bvm_checkout_session_boot_stripe')) {
         $configPath = bvm_checkout_session_public_root() . '/includes/stripe_config.php';
         $exists = is_file($configPath);
 
-
-         if ($exists) {
+        if ($exists) {
             /** @noinspection PhpIncludeInspection */
             @include_once $configPath;
         }
 
         $hasSecretFunction = function_exists('bv_stripe_secret_key');
         $isReady = function_exists('bv_stripe_is_ready') && bv_stripe_is_ready();
-
 
         return $hasSecretFunction && $isReady;
     }
@@ -661,21 +613,21 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
     function bvm_checkout_session_create_stripe_session(array $order, array $buyer): array
     {
         if (!bvm_checkout_session_boot_stripe()) {
-           bvm_checkout_session_stripe_error_log($orderId, 0, null, 'stripe_config_missing', 'Stripe configuration is unavailable.');
-            bvm_checkout_session_error('stripe_config_missing', 'Stripe configuration is unavailable.', 500);
+             bvm_checkout_session_error('stripe_config_missing', 'Stripe configuration is unavailable.', 500);
         }
 
         if (!function_exists('curl_init')) {
-            bvm_checkout_session_stripe_error_log($orderId, 0, null, 'curl_extension_missing', 'Stripe API unavailable: curl extension missing.');
+            error_log('[BV Mobile Checkout Session] stripe_session_failed: curl extension missing');
             bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
         }
 
         $secretKey = trim((string) bv_stripe_secret_key());
         if ($secretKey === '') {
-            bvm_checkout_session_stripe_error_log($orderId, 0, null, 'stripe_config_missing', 'Stripe configuration is unavailable.');
+            error_log('[BV Mobile Checkout Session] stripe_config_missing: empty secret key');
             bvm_checkout_session_error('stripe_config_missing', 'Stripe configuration is unavailable.', 500);
         }
 
+        $orderId = (int) $order['id'];
         $orderCode = trim((string) ($order['order_code'] ?? ''));
         $currency = 'usd';
         $amount = bvm_checkout_session_money_to_stripe_amount($order['total'], (string) $order['currency']);
@@ -727,7 +679,7 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
 
         $ch = curl_init('https://api.stripe.com/v1/checkout/sessions');
         if ($ch === false) {
-           bvm_checkout_session_stripe_error_log($orderId, 0, null, 'curl_init_failed', 'Stripe API unavailable: curl_init failed.');
+            error_log('[BV Mobile Checkout Session] stripe_session_failed: curl_init failed');
             bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
         }
 
@@ -757,39 +709,37 @@ if (!function_exists('bvm_checkout_session_create_stripe_session')) {
                 $response = null;
             }
         }
- 
-
-        $stripeErrorCode = '';
+        $stripeErrorType = '';
         $stripeErrorMessage = '';
         if (isset($response['error']) && is_array($response['error'])) {
-             $stripeErrorCode = isset($response['error']['code']) ? (string) $response['error']['code'] : '';
-            if ($stripeErrorCode === '' && isset($response['error']['type'])) {
-                $stripeErrorCode = (string) $response['error']['type'];
-            }
+            $stripeErrorType = isset($response['error']['type']) ? (string) $response['error']['type'] : '';
             $stripeErrorMessage = isset($response['error']['message']) ? (string) $response['error']['message'] : '';
         }
-        if ($stripeErrorCode === '') {
-            $stripeErrorCode = $curlError !== '' ? 'curl_error' : 'stripe_session_failed';
-        }
-        if ($stripeErrorMessage === '') {
-            $stripeErrorMessage = $curlError !== '' ? $curlError : 'Unable to create Stripe Checkout Session.';
-        }
-		
-        $sessionId = isset($response['id']) ? trim((string) $response['id']) : '';
+
         if ($rawResponse === false || $httpStatus < 200 || $httpStatus >= 300 || !is_array($response)) {
-           bvm_checkout_session_stripe_error_log($orderId, $httpStatus, $sessionId, $stripeErrorCode, $stripeErrorMessage);  
+            $errMsg = '[BV Mobile Checkout Session] stripe_session_failed'
+                . ' order_id=' . $orderId
+                . ' http_status=' . $httpStatus;
+            if ($stripeErrorType !== '') {
+                $errMsg .= ' error_type=' . $stripeErrorType;
+            }
+            if ($stripeErrorMessage !== '') {
+                $errMsg .= ' error_message=' . $stripeErrorMessage;
+            }
+            if ($curlError !== '') {
+                $errMsg .= ' curl_error=' . $curlError;
+            }
+            error_log($errMsg);
             bvm_checkout_session_error('stripe_session_failed', 'Unable to create Stripe Checkout Session.', 502);
         }
 
- 
+         $sessionId = isset($response['id']) ? trim((string) $response['id']) : '';
         $checkoutUrl = trim((string) ($response['url'] ?? ''));
- 
 
         if ($checkoutUrl === '') {
-            bvm_checkout_session_stripe_error_log($orderId, $httpStatus, $sessionId, 'incomplete_stripe_response', 'Stripe Checkout Session response was incomplete.');
+            error_log('[BV Mobile Checkout Session] stripe_session_failed: response missing url order_id=' . $orderId . ' http_status=' . $httpStatus);
             bvm_checkout_session_error('stripe_session_failed', 'Stripe Checkout Session response was incomplete.', 502);
         }
- 
 
         return [
             'session_id' => $sessionId, 
