@@ -15,14 +15,12 @@ header('Content-Type: application/json; charset=UTF-8');
 header('X-Content-Type-Options: nosniff');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    echo json_encode([
-        'ok' => false,
-        'error' => ['code' => 'method_not_allowed', 'message' => 'Only POST requests are accepted.'],
-    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    exit;
-}
+$GLOBALS['bvm_buyer_offer_checkout_request_id'] = bin2hex(random_bytes(8));
+$GLOBALS['bvm_buyer_offer_checkout_log_context'] = [
+    'request_id' => $GLOBALS['bvm_buyer_offer_checkout_request_id'],
+    'remote_ip' => $_SERVER['REMOTE_ADDR'] ?? null,
+    'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? null,
+];
 
 function bvm_buyer_offer_checkout_public_root(): string
 {
@@ -32,6 +30,70 @@ function bvm_buyer_offer_checkout_public_root(): string
 function bvm_buyer_offer_checkout_project_root(): string
 {
     return dirname(bvm_buyer_offer_checkout_public_root());
+}
+
+function bvm_buyer_offer_checkout_request_id(): string
+{
+    return (string) ($GLOBALS['bvm_buyer_offer_checkout_request_id'] ?? '');
+}
+
+function bvm_buyer_offer_checkout_meta(): array
+{
+    return [
+        'api_version' => 'mobile-v1',
+        'generated_at' => gmdate('Y-m-d H:i:s'),
+        'request_id' => bvm_buyer_offer_checkout_request_id(),
+    ];
+}
+
+function bvm_buyer_offer_checkout_set_log_context(array $context): void
+{
+    $safeKeys = [
+        'request_id' => true,
+        'buyer_user_id' => true,
+        'offer_id' => true,
+        'listing_id' => true,
+        'token_id' => true,
+        'remote_ip' => true,
+        'user_agent' => true,
+    ];
+
+    foreach ($context as $key => $value) {
+        if (!isset($safeKeys[$key]) || $value === null || $value === '') {
+            continue;
+        }
+
+        $GLOBALS['bvm_buyer_offer_checkout_log_context'][$key] = $value;
+    }
+}
+
+function bvm_buyer_offer_checkout_log_event(string $event, array $context = []): void
+{
+    $blockedKeys = [
+        'bearer_token' => true,
+        'checkout_token' => true,
+        'token' => true,
+        'token_hash' => true,
+        'password' => true,
+        'db_pass' => true,
+        'db_password' => true,
+    ];
+
+    $base = $GLOBALS['bvm_buyer_offer_checkout_log_context'] ?? [];
+    $payload = ['event' => $event] + $base;
+
+    foreach ($context as $key => $value) {
+        if (isset($blockedKeys[$key])) {
+            continue;
+        }
+
+        if (is_scalar($value) || $value === null) {
+            $payload[$key] = $value;
+        }
+    }
+
+    $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    error_log('[BV Mobile Buyer Offer Checkout] ' . ($json === false ? $event : $json));
 }
 
 function bvm_buyer_offer_checkout_json(int $statusCode, array $payload): void
@@ -51,12 +113,30 @@ function bvm_buyer_offer_checkout_error(string $code, string $message, int $stat
     bvm_buyer_offer_checkout_json($statusCode, [
         'ok' => false,
         'error' => ['code' => $code, 'message' => $message],
+        'meta' => bvm_buyer_offer_checkout_meta(),
     ]);
 }
 
-function bvm_buyer_offer_checkout_log(string $message): void
+function bvm_buyer_offer_checkout_base_url(): string
 {
-    error_log('[BV Mobile Buyer Offer Checkout] ' . $message);
+    if (defined('BETTAVARO_BASE_URL') && trim((string) constant('BETTAVARO_BASE_URL')) !== '') {
+        return rtrim(trim((string) constant('BETTAVARO_BASE_URL')), '/');
+    }
+
+    foreach (['APP_URL', 'BETTAVARO_BASE_URL'] as $envName) {
+        $value = getenv($envName);
+        if (is_string($value) && trim($value) !== '') {
+            return rtrim(trim($value), '/');
+        }
+    }
+
+    return 'https://www.bettavaro.com';
+}
+
+bvm_buyer_offer_checkout_log_event('request_started');
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    bvm_buyer_offer_checkout_error('method_not_allowed', 'Only POST requests are accepted.', 405);
 }
 
 function bvm_buyer_offer_checkout_pdo(): PDO
@@ -206,7 +286,7 @@ function bvm_buyer_offer_checkout_authenticate(PDO $pdo): int
         $update = $pdo->prepare('UPDATE mobile_auth_tokens SET last_used_at = UTC_TIMESTAMP() WHERE id = :id LIMIT 1');
         $update->execute([':id' => (int) $row['id']]);
     } catch (Throwable $e) {
-        bvm_buyer_offer_checkout_log('Unable to update token last_used_at: ' . $e->getMessage());
+        bvm_buyer_offer_checkout_log_event('auth_last_used_update_failed', ['message' => $e->getMessage()]);
     }
 
     return (int) $row['user_id'];
@@ -235,7 +315,7 @@ function bvm_buyer_offer_checkout_required_offer_id(array $data): int
     ]);
 
     if ($offerId === false) {
-        bvm_buyer_offer_checkout_error('missing_offer_id', 'Missing offer_id.', 400);
+        bvm_buyer_offer_checkout_error('invalid_offer_id', 'Invalid offer_id.', 400);
     }
 
     return (int) $offerId;
@@ -286,6 +366,19 @@ function bvm_buyer_offer_checkout_nullable_float($value): ?float
     return $value === null ? null : (float) $value;
 }
 
+function bvm_buyer_offer_checkout_rate_limit_guard(PDO $pdo, int $buyerUserId): void
+{
+    unset($pdo);
+
+    // No existing reliable request-log table is guaranteed in this deployment package.
+    // Keep this guard as a production-safe no-op rather than introducing a hard dependency
+    // that could break mobile checkout during rollout.
+    bvm_buyer_offer_checkout_log_event('rate_limit_skipped', [
+        'buyer_user_id' => $buyerUserId,
+        'reason' => 'no_reliable_existing_rate_limit_table',
+    ]);
+}
+
 function bvm_buyer_offer_checkout_plain_token_from_row(array $row, array $tokenColumns): ?string
 {
     if (!bvm_buyer_offer_checkout_has_column($tokenColumns, 'token')) {
@@ -298,34 +391,76 @@ function bvm_buyer_offer_checkout_plain_token_from_row(array $row, array $tokenC
 
 function bvm_buyer_offer_checkout_find_active_token(PDO $pdo, int $offerId, array $tokenColumns): ?array
 {
-    $select = ['id', 'expires_at'];
-    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token')) {
-        $select[] = 'token';
-    }
-    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token_hash')) {
-        $select[] = 'token_hash';
+    $select = ['id'];
+    foreach (['expires_at', 'token', 'token_hash', 'status', 'used_at'] as $column) {
+        if (bvm_buyer_offer_checkout_has_column($tokenColumns, $column)) {
+            $select[] = $column;
+        }
     }
 
-    $where = [
-        'offer_id = :offer_id',
-        "status = 'active'",
-        'expires_at >= UTC_TIMESTAMP()',
-    ];
+    $where = ['offer_id = :offer_id'];
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'status')) {
+        $where[] = "status = 'active'";
+    }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'expires_at')) {
+        $where[] = 'expires_at >= UTC_TIMESTAMP()';
+    }
     if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'used_at')) {
         $where[] = 'used_at IS NULL';
     }
 
+    // Transaction locks prevent double taps/concurrent requests from creating multiple active tokens.
     $stmt = $pdo->prepare(
         'SELECT ' . implode(', ', $select) . ' '
         . 'FROM listing_offer_checkout_tokens '
         . 'WHERE ' . implode(' AND ', $where) . ' '
-        . 'ORDER BY expires_at DESC, id DESC '
+        . 'ORDER BY ' . (bvm_buyer_offer_checkout_has_column($tokenColumns, 'expires_at') ? 'expires_at DESC, ' : '') . 'id DESC '
         . 'LIMIT 1 FOR UPDATE'
     );
     $stmt->execute([':offer_id' => $offerId]);
     $row = $stmt->fetch();
 
     return $row ?: null;
+}
+
+function bvm_buyer_offer_checkout_invalidate_active_tokens(PDO $pdo, int $offerId, array $tokenColumns): int
+{
+    $set = [];
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'status')) {
+        $set[] = "status = 'expired'";
+    }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'expires_at')) {
+        $set[] = 'expires_at = UTC_TIMESTAMP()';
+    }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'updated_at')) {
+        $set[] = 'updated_at = UTC_TIMESTAMP()';
+    }
+
+    if ($set === []) {
+        return 0;
+    }
+
+    $where = ['offer_id = :offer_id'];
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'status')) {
+        $where[] = "status = 'active'";
+    }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'expires_at')) {
+        $where[] = 'expires_at >= UTC_TIMESTAMP()';
+    }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'used_at')) {
+        $where[] = 'used_at IS NULL';
+    }
+
+    // Old active tokens are revoked/expired before issuing a fresh one so only the just-returned
+    // plain token can be used by the mobile handoff. Do not mark used_at unless actually consumed.
+    $stmt = $pdo->prepare(
+        'UPDATE listing_offer_checkout_tokens '
+        . 'SET ' . implode(', ', $set) . ' '
+        . 'WHERE ' . implode(' AND ', $where)
+    );
+    $stmt->execute([':offer_id' => $offerId]);
+
+    return $stmt->rowCount();
 }
 
 function bvm_buyer_offer_checkout_create_token(PDO $pdo, array $offer, array $tokenColumns): array
@@ -350,16 +485,23 @@ function bvm_buyer_offer_checkout_create_token(PDO $pdo, array $offer, array $to
         'seller_user_id' => (int) $offer['seller_user_id'],
         'currency' => (string) $offer['currency'],
         'agreed_price' => number_format((float) $offer['agreed_price'], 2, '.', ''),
-        'status' => 'active',
-        'expires_at' => (string) $expiresAt,
     ];
 
-    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token')) {
-        $insertValues['token'] = $token;
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'status')) {
+        $insertValues['status'] = 'active';
     }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'expires_at')) {
+        $insertValues['expires_at'] = (string) $expiresAt;
+    }
+
     if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token_hash')) {
         $insertValues['token_hash'] = $tokenHash;
+    } elseif (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token')) {
+        // Plain checkout tokens are legacy-only. In the hash-capable schema, the plain token is
+        // returned once in this API response and never persisted or logged.
+        $insertValues['token'] = $token;
     }
+
     if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'used_at')) {
         $insertValues['used_at'] = null;
     }
@@ -392,9 +534,20 @@ function bvm_buyer_offer_checkout_create_token(PDO $pdo, array $offer, array $to
     $stmt->execute($params);
 
     return [
+        'id' => (int) $pdo->lastInsertId(),
         'token' => $token,
         'expires_at' => (string) $expiresAt,
     ];
+}
+
+function bvm_buyer_offer_checkout_is_duplicate_key(Throwable $e): bool
+{
+    if (!$e instanceof PDOException) {
+        return false;
+    }
+
+    $errorInfo = $e->errorInfo;
+    return (($errorInfo[0] ?? null) === '23000') || ((int) ($errorInfo[1] ?? 0) === 1062);
 }
 
 function bvm_buyer_offer_checkout_offer_payload(array $offer): array
@@ -411,11 +564,18 @@ function bvm_buyer_offer_checkout_offer_payload(array $offer): array
 try {
     $pdo = bvm_buyer_offer_checkout_pdo();
     $buyerUserId = bvm_buyer_offer_checkout_authenticate($pdo);
+    bvm_buyer_offer_checkout_set_log_context(['buyer_user_id' => $buyerUserId]);
+    bvm_buyer_offer_checkout_log_event('auth_ok');
+
+    bvm_buyer_offer_checkout_rate_limit_guard($pdo, $buyerUserId);
+
     $requestData = bvm_buyer_offer_checkout_request_data();
     $offerId = bvm_buyer_offer_checkout_required_offer_id($requestData);
+    bvm_buyer_offer_checkout_set_log_context(['offer_id' => $offerId]);
 
     $pdo->beginTransaction();
 
+    // The offer row is locked so concurrent double taps observe one serialized checkout-token decision.
     $offerStmt = $pdo->prepare(
         'SELECT id, listing_id, buyer_user_id, seller_user_id, status, currency, agreed_price, expires_at, completed_order_id '
         . 'FROM listing_offers '
@@ -432,6 +592,12 @@ try {
         $pdo->rollBack();
         bvm_buyer_offer_checkout_error('offer_not_found', 'Offer not found.', 404);
     }
+
+    bvm_buyer_offer_checkout_set_log_context([
+        'offer_id' => (int) $offer['id'],
+        'listing_id' => (int) $offer['listing_id'],
+    ]);
+    bvm_buyer_offer_checkout_log_event('offer_locked');
 
     $status = (string) $offer['status'];
     if (!in_array($status, ['seller_accepted', 'buyer_checkout_ready'], true)) {
@@ -466,6 +632,7 @@ try {
         }
     }
 
+    // Listing is also locked to keep availability consistent with the accepted offer during handoff.
     $listingStmt = $pdo->prepare(
         'SELECT ' . implode(', ', $listingSelect) . ' '
         . 'FROM listings '
@@ -474,6 +641,7 @@ try {
     );
     $listingStmt->execute([':listing_id' => (int) $offer['listing_id']]);
     $listing = $listingStmt->fetch();
+    bvm_buyer_offer_checkout_log_event('listing_locked');
 
     $listingStatus = strtolower((string) ($listing['status'] ?? ''));
     $saleStatus = strtolower((string) ($listing['sale_status'] ?? 'available'));
@@ -495,17 +663,58 @@ try {
 
     if ($activeToken !== null) {
         $plainToken = bvm_buyer_offer_checkout_plain_token_from_row($activeToken, $tokenColumns);
-        if ($plainToken === null) {
-            $pdo->rollBack();
-            bvm_buyer_offer_checkout_error('checkout_token_unavailable', 'Active checkout token cannot be returned.', 500);
+        if ($plainToken !== null) {
+            $checkoutToken = $plainToken;
+            $tokenExpiresAt = (string) ($activeToken['expires_at'] ?? $offer['expires_at'] ?? '');
+            bvm_buyer_offer_checkout_set_log_context(['token_id' => (int) $activeToken['id']]);
+            bvm_buyer_offer_checkout_log_event('active_token_reused');
+        } else {
+            bvm_buyer_offer_checkout_set_log_context(['token_id' => (int) $activeToken['id']]);
+            $invalidatedRows = bvm_buyer_offer_checkout_invalidate_active_tokens($pdo, (int) $offer['id'], $tokenColumns);
+            bvm_buyer_offer_checkout_log_event('active_token_invalidated', ['invalidated_rows' => $invalidatedRows]);
+            $activeToken = null;
+        }
+    }
+
+    if ($activeToken === null) {
+        $tokenWasCreated = true;
+        try {
+            $createdToken = bvm_buyer_offer_checkout_create_token($pdo, $offer, $tokenColumns);
+        } catch (Throwable $e) {
+            if (!bvm_buyer_offer_checkout_is_duplicate_key($e)) {
+                throw $e;
+            }
+
+            $duplicateToken = bvm_buyer_offer_checkout_find_active_token($pdo, (int) $offer['id'], $tokenColumns);
+            $duplicatePlainToken = $duplicateToken === null ? null : bvm_buyer_offer_checkout_plain_token_from_row($duplicateToken, $tokenColumns);
+            if ($duplicateToken !== null && $duplicatePlainToken !== null) {
+                $createdToken = [
+                    'id' => (int) $duplicateToken['id'],
+                    'token' => $duplicatePlainToken,
+                    'expires_at' => (string) ($duplicateToken['expires_at'] ?? $offer['expires_at'] ?? ''),
+                ];
+                $tokenWasCreated = false;
+                bvm_buyer_offer_checkout_set_log_context(['token_id' => (int) $duplicateToken['id']]);
+                bvm_buyer_offer_checkout_log_event('active_token_reused', ['duplicate_key_recovered' => true]);
+            } else {
+                if ($duplicateToken !== null) {
+                    bvm_buyer_offer_checkout_set_log_context(['token_id' => (int) $duplicateToken['id']]);
+                }
+                $invalidatedRows = bvm_buyer_offer_checkout_invalidate_active_tokens($pdo, (int) $offer['id'], $tokenColumns);
+                bvm_buyer_offer_checkout_log_event('active_token_invalidated', [
+                    'invalidated_rows' => $invalidatedRows,
+                    'duplicate_key_recovered' => true,
+                ]);
+                $createdToken = bvm_buyer_offer_checkout_create_token($pdo, $offer, $tokenColumns);
+            }
         }
 
-        $checkoutToken = $plainToken;
-        $tokenExpiresAt = (string) $activeToken['expires_at'];
-    } else {
-        $createdToken = bvm_buyer_offer_checkout_create_token($pdo, $offer, $tokenColumns);
         $checkoutToken = $createdToken['token'];
         $tokenExpiresAt = $createdToken['expires_at'];
+        bvm_buyer_offer_checkout_set_log_context(['token_id' => (int) $createdToken['id']]);
+        if ($tokenWasCreated) {
+            bvm_buyer_offer_checkout_log_event('token_created');
+        }
     }
 
     $freshOfferStmt = $pdo->prepare(
@@ -525,12 +734,15 @@ try {
         bvm_buyer_offer_checkout_error('offer_not_found', 'Offer not found.', 404);
     }
 
-    $checkoutUrl = 'https://www.bettavaro.com/offer_accept_checkout.php?offer_id='
+    $checkoutUrl = bvm_buyer_offer_checkout_base_url()
+        . '/offer_accept_checkout.php?offer_id='
         . (int) $freshOffer['id']
         . '&token='
         . rawurlencode($checkoutToken);
 
     $pdo->commit();
+
+    bvm_buyer_offer_checkout_log_event('checkout_ready');
 
     bvm_buyer_offer_checkout_json(200, [
         'ok' => true,
@@ -542,16 +754,16 @@ try {
                 'token_expires_at' => $tokenExpiresAt,
             ],
         ],
-        'meta' => [
-            'api_version' => 'mobile-v1',
-            'generated_at' => gmdate('Y-m-d H:i:s'),
-        ],
+        'meta' => bvm_buyer_offer_checkout_meta(),
     ]);
 } catch (Throwable $e) {
     if (isset($pdo) && $pdo instanceof PDO && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
 
-    bvm_buyer_offer_checkout_log('Database/server error: ' . $e->getMessage());
+    bvm_buyer_offer_checkout_log_event('server_error', [
+        'message' => $e->getMessage(),
+        'exception' => get_class($e),
+    ]);
     bvm_buyer_offer_checkout_error('server_error', 'A server error occurred.', 500);
 }
