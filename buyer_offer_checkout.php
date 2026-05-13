@@ -495,10 +495,13 @@ function bvm_buyer_offer_checkout_create_token(PDO $pdo, array $offer, array $to
     }
 
     if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token_hash')) {
+       // token_hash is the preferred production validation path for new checkout tokens.		
         $insertValues['token_hash'] = $tokenHash;
-    } elseif (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token')) {
-        // Plain checkout tokens are legacy-only. In the hash-capable schema, the plain token is
-        // returned once in this API response and never persisted or logged.
+   }
+    if (bvm_buyer_offer_checkout_has_column($tokenColumns, 'token')) {
+        // Temporary legacy compatibility: persist the plain token only while the website
+        // cart/checkout bridge still requires offer_token. Remove this persistence after
+        // cart/checkout can rely exclusively on token_id and offer_id. 
         $insertValues['token'] = $token;
     }
 

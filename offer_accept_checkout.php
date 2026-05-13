@@ -138,6 +138,195 @@ if (!function_exists('bv_offer_accept_checkout_money')) {
     }
 }
 
+if (!function_exists('bv_offer_accept_checkout_pdo')) {
+    function bv_offer_accept_checkout_pdo(): ?PDO
+    {
+        foreach (['pdo', 'db', 'conn'] as $name) {
+            if (($GLOBALS[$name] ?? null) instanceof PDO) {
+                $GLOBALS[$name]->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+                $GLOBALS[$name]->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+                return $GLOBALS[$name];
+            }
+        }
+
+        $candidates = [
+            __DIR__ . '/config/db.php',
+            __DIR__ . '/includes/db.php',
+            dirname(__DIR__) . '/config/db.php',
+            dirname(__DIR__) . '/includes/db.php',
+        ];
+
+        foreach ($candidates as $path) {
+            if (!is_file($path)) {
+                continue;
+            }
+
+            $loader = static function (string $includePath): array {
+                $db_host = $db_user = $db_pass = $db_name = $db_port = null;
+                $host = $user = $pass = $name = $port = null;
+                $DB_HOST = $DB_USER = $DB_PASS = $DB_NAME = $DB_PORT = null;
+                $dsn = null;
+                $pdo = $db = $conn = null;
+
+                ob_start();
+                /** @noinspection PhpIncludeInspection */
+                include $includePath;
+                @ob_end_clean();
+
+                return compact(
+                    'db_host', 'db_user', 'db_pass', 'db_name', 'db_port',
+                    'host', 'user', 'pass', 'name', 'port',
+                    'DB_HOST', 'DB_USER', 'DB_PASS', 'DB_NAME', 'DB_PORT',
+                    'dsn', 'pdo', 'db', 'conn'
+                );
+            };
+
+            $vars = $loader($path);
+            foreach (['pdo', 'db', 'conn'] as $name) {
+                if (($vars[$name] ?? null) instanceof PDO) {
+                    $pdo = $vars[$name];
+                    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+                    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+                    return $pdo;
+                }
+            }
+
+            $dsn = $vars['dsn'] ?? null;
+            $dbHost = $vars['db_host'] ?? $vars['host'] ?? $vars['DB_HOST'] ?? null;
+            $dbUser = $vars['db_user'] ?? $vars['user'] ?? $vars['DB_USER'] ?? null;
+            $dbPass = $vars['db_pass'] ?? $vars['pass'] ?? $vars['DB_PASS'] ?? '';
+            $dbName = $vars['db_name'] ?? $vars['name'] ?? $vars['DB_NAME'] ?? null;
+            $dbPort = $vars['db_port'] ?? $vars['port'] ?? $vars['DB_PORT'] ?? 3306;
+
+            if (is_string($dsn) && $dsn !== '') {
+                return new PDO($dsn, (string) $dbUser, (string) $dbPass, [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                ]);
+            }
+
+            if ($dbHost !== null && $dbUser !== null && $dbName !== null) {
+                return new PDO(
+                    'mysql:host=' . (string) $dbHost . ';port=' . (int) $dbPort . ';dbname=' . (string) $dbName . ';charset=utf8mb4',
+                    (string) $dbUser,
+                    (string) $dbPass,
+                    [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                        PDO::ATTR_EMULATE_PREPARES => false,
+                    ]
+                );
+            }
+        }
+
+        return null;
+    }
+}
+
+if (!function_exists('bv_offer_accept_checkout_token_columns')) {
+    function bv_offer_accept_checkout_token_columns(PDO $pdo): array
+    {
+        static $columns = null;
+        if (is_array($columns)) {
+            return $columns;
+        }
+
+        $stmt = $pdo->prepare(
+            'SELECT COLUMN_NAME '
+            . 'FROM information_schema.COLUMNS '
+            . 'WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name'
+        );
+        $stmt->execute([':table_name' => 'listing_offer_checkout_tokens']);
+
+        $columns = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $columns[(string) $row['COLUMN_NAME']] = true;
+        }
+
+        return $columns;
+    }
+}
+
+if (!function_exists('bv_offer_accept_checkout_has_token_column')) {
+    function bv_offer_accept_checkout_has_token_column(array $columns, string $column): bool
+    {
+        return isset($columns[$column]);
+    }
+}
+
+if (!function_exists('bv_offer_accept_checkout_validate_token_by_hash')) {
+    function bv_offer_accept_checkout_validate_token_by_hash(string $tokenValue, int $currentUserId): ?array
+    {
+        if ($tokenValue === '' || $currentUserId <= 0) {
+            return null;
+        }
+
+        $pdo = bv_offer_accept_checkout_pdo();
+        if (!$pdo instanceof PDO) {
+            return null;
+        }
+
+        $columns = bv_offer_accept_checkout_token_columns($pdo);
+        foreach (['token_hash', 'status', 'used_at', 'expires_at', 'buyer_user_id'] as $requiredColumn) {
+            if (!bv_offer_accept_checkout_has_token_column($columns, $requiredColumn)) {
+                return null;
+            }
+        }
+
+        $select = ['id', 'offer_id', 'listing_id', 'buyer_user_id'];
+        foreach (['seller_user_id', 'currency', 'agreed_price', 'expires_at', 'status', 'used_at'] as $column) {
+            if (bv_offer_accept_checkout_has_token_column($columns, $column)) {
+                $select[] = $column;
+            }
+        }
+        if (bv_offer_accept_checkout_has_token_column($columns, 'token')) {
+            // Temporary legacy compatibility: keep offer_token available only for the existing
+            // cart bridge. Remove token persistence and this payload value after cart/checkout no
+            // longer requires offer_token and can rely exclusively on token_id and offer_id.
+            $select[] = 'token';
+        }
+
+        $where = [
+            'token_hash = :token_hash',
+            "status = 'active'",
+            'used_at IS NULL',
+            'expires_at >= UTC_TIMESTAMP()',
+            'buyer_user_id = :buyer_user_id',
+        ];
+
+        // token_hash is the preferred production validation path. Do not select or expose token_hash.
+        $stmt = $pdo->prepare(
+            'SELECT ' . implode(', ', $select) . ' '
+            . 'FROM listing_offer_checkout_tokens '
+            . 'WHERE ' . implode(' AND ', $where) . ' '
+            . 'ORDER BY id DESC LIMIT 1'
+        );
+        $stmt->execute([
+            ':token_hash' => hash('sha256', $tokenValue),
+            ':buyer_user_id' => $currentUserId,
+        ]);
+
+        $row = $stmt->fetch();
+        return $row ?: null;
+    }
+}
+
+if (!function_exists('bv_offer_accept_checkout_validate_token')) {
+    function bv_offer_accept_checkout_validate_token(string $tokenValue, int $currentUserId): ?array
+    {
+        // token_hash is the preferred production validation path for checkout links.
+        $token = bv_offer_accept_checkout_validate_token_by_hash($tokenValue, $currentUserId);
+        if ($token) {
+            return $token;
+        }
+
+        // Temporary backward compatibility: legacy records may still have only the plain token.
+        return bv_offer_validate_checkout_token($tokenValue, $currentUserId) ?: null;
+    }
+}
+
+
 if (!function_exists('bv_offer_accept_checkout_find_active_token_for_offer')) {
     function bv_offer_accept_checkout_find_active_token_for_offer(array $offer, int $currentUserId): ?array
     {
@@ -334,7 +523,7 @@ $offer = null;
 $token = null;
 
 if ($tokenValue !== '') {
-    $token = bv_offer_validate_checkout_token($tokenValue, $currentUserId);
+     $token = bv_offer_accept_checkout_validate_token($tokenValue, $currentUserId);
     if (!$token) {
         bv_offer_accept_checkout_render_error_page(
             'Checkout link is invalid',
