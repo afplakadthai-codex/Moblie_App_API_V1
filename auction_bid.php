@@ -629,40 +629,52 @@ function bv_mobile_auction_listing_path(int $listingId, ?string $slug): string
     return '/listing.php';
 }
 
-function bv_mobile_auction_create_outbid_in_app_notification(PDO $pdo, array $context): bool
+function bv_mobile_auction_create_outbid_in_app_notification(PDO $pdo, array $context): array
 {
+    $listingId = (int) ($context['listing_id'] ?? 0);
+    $userId = (int) ($context['previous_bidder_user_id'] ?? 0);
+    $message = 'Someone placed a higher bid on your auction item.';
+    $url = $listingId > 0 ? '/listing.php?id=' . $listingId : '/listing.php';
+	
     try {
         if (!bv_mobile_auction_table_exists($pdo, 'notifications')) {
-            bv_mobile_auction_log('outbid_in_app_notification_skipped notifications_table_missing listing_id=' . (int) ($context['listing_id'] ?? 0));
-            return false;
+           bv_mobile_auction_log('outbid_in_app_notification_skipped notifications_table_missing listing_id=' . $listingId);
+            return ['created' => false, 'error' => 'notifications unavailable'];
         }
 
         $columns = bv_mobile_auction_columns($pdo, 'notifications');
         foreach (['user_id', 'type', 'title', 'message', 'url', 'is_read', 'created_at'] as $requiredColumn) {
             if (!isset($columns[$requiredColumn])) {
-                bv_mobile_auction_log('outbid_in_app_notification_skipped notifications_' . $requiredColumn . '_column_missing listing_id=' . (int) ($context['listing_id'] ?? 0));
-                return false;
+                 bv_mobile_auction_log('outbid_in_app_notification_skipped notifications_' . $requiredColumn . '_column_missing listing_id=' . $listingId);
+                return ['created' => false, 'error' => 'notifications unavailable'];
             }
         }
 
-        $userId = (int) ($context['previous_bidder_user_id'] ?? 0);
         if ($userId <= 0) {
-            bv_mobile_auction_log('outbid_in_app_notification_skipped recipient_unavailable listing_id=' . (int) ($context['listing_id'] ?? 0));
-            return false;
+             bv_mobile_auction_log('outbid_in_app_notification_skipped recipient_unavailable listing_id=' . $listingId);
+            return ['created' => false, 'error' => 'recipient unavailable'];
         }
 
-        $currency = trim((string) ($context['currency'] ?? 'USD'));
-        if ($currency === '') {
-            $currency = 'USD';
+        $dedupe = $pdo->prepare(
+            'SELECT `id` FROM `notifications`'
+            . ' WHERE `user_id` = :user_id'
+            . ' AND `type` = :type'
+            . ' AND `url` = :url'
+            . ' AND `created_at` >= (NOW() - INTERVAL 2 MINUTE)'
+            . ' AND `message` LIKE :message'
+            . ' ORDER BY `id` DESC LIMIT 1'
+        );
+        $dedupe->execute([
+            ':user_id' => $userId,
+            ':type' => 'auction.outbid',
+            ':url' => $url,
+            ':message' => $message,
+        ]);
+        if ($dedupe->fetchColumn() !== false) {
+            bv_mobile_auction_log('outbid_in_app_notification_skipped duplicate_recent listing_id=' . $listingId . ' previous_bidder_user_id=' . $userId . ' bid_id=' . (int) ($context['bid_id'] ?? 0));
+            return ['created' => true, 'error' => null];
         }
-        $previousAmount = number_format((float) ($context['previous_bid_amount'] ?? 0), 2, '.', '');
-        $newAmount = number_format((float) ($context['new_bid_amount'] ?? 0), 2, '.', '');
-        $listingTitle = trim((string) ($context['listing_title'] ?? 'Auction listing'));
-        if ($listingTitle === '') {
-            $listingTitle = 'Auction listing';
-        }
-        $listingId = (int) ($context['listing_id'] ?? 0);
-        $listingSlug = isset($context['listing_slug']) ? (string) $context['listing_slug'] : null;
+ 
 
         $stmt = $pdo->prepare(
             'INSERT INTO `notifications` (`user_id`, `type`, `title`, `message`, `url`, `is_read`, `created_at`)'
@@ -672,16 +684,16 @@ function bv_mobile_auction_create_outbid_in_app_notification(PDO $pdo, array $co
             ':user_id' => $userId,
             ':type' => 'auction.outbid',
             ':title' => 'You have been outbid',
-            ':message' => 'You have been outbid on ' . $listingTitle . '. Your previous bid was ' . $currency . ' ' . $previousAmount . '. The new highest bid is ' . $currency . ' ' . $newAmount . '.',
-            ':url' => bv_mobile_auction_listing_path($listingId, $listingSlug),
+            ':message' => $message,
+            ':url' => $url, 
             ':is_read' => 0,
         ]);
 
         bv_mobile_auction_log('outbid_in_app_notification_created listing_id=' . $listingId . ' previous_bidder_user_id=' . $userId . ' bid_id=' . (int) ($context['bid_id'] ?? 0));
-        return true;
+         return ['created' => true, 'error' => null]; 
     } catch (Throwable $e) {
-        bv_mobile_auction_log('outbid_in_app_notification_failed ' . $e->getMessage() . ' listing_id=' . (int) ($context['listing_id'] ?? 0));
-        return false;
+       bv_mobile_auction_log('outbid_in_app_notification_failed ' . $e->getMessage() . ' listing_id=' . $listingId);
+        return ['created' => false, 'error' => 'notification failed']; 
     }
 }
 
@@ -1079,7 +1091,8 @@ try {
         'new_highest_bidder_user_id' => $userId,
         'new_highest_bid_amount' => $bidAmount,
         'notification_queued' => false,
-        'notification_in_app_created' => false,		
+        'notification_in_app_created' => false,
+        'notification_in_app_error' => null,	
     ];
     $outbidNotificationContext = null;
     if ($wasOutbid) {
@@ -1095,13 +1108,17 @@ try {
             'new_bid_amount' => $bidAmount,
             'bid_id' => $bidId,
         ];
-    }	
+    }
 
     $pdo->commit();
 
     if ($outbidNotificationContext !== null) {
         $outbid['notification_queued'] = bv_mobile_auction_queue_outbid_email($pdo, $outbidNotificationContext);
-        $outbid['notification_in_app_created'] = bv_mobile_auction_create_outbid_in_app_notification($pdo, $outbidNotificationContext);
+         $inAppNotification = bv_mobile_auction_create_outbid_in_app_notification($pdo, $outbidNotificationContext);
+        $outbid['notification_in_app_created'] = (bool) ($inAppNotification['created'] ?? false);
+        if (!empty($inAppNotification['error'])) {
+            $outbid['notification_in_app_error'] = (string) $inAppNotification['error'];
+        }  
     } else {
         bv_mobile_auction_log('outbid_in_app_notification_skipped no_outbid listing_id=' . $listingId);		
     }
@@ -1114,8 +1131,11 @@ try {
         'new_highest_bidder_user_id' => (int) ($outbid['new_highest_bidder_user_id'] ?? $userId),
         'new_highest_bid_amount' => (float) ($outbid['new_highest_bid_amount'] ?? $bidAmount),
         'notification_queued' => (bool) ($outbid['notification_queued'] ?? false),
-        'notification_in_app_created' => (bool) ($outbid['notification_in_app_created'] ?? false),		
-    ];	
+         'notification_in_app_created' => (bool) ($outbid['notification_in_app_created'] ?? false),
+    ];
+    if (!empty($outbid['notification_in_app_error'])) {
+        $outbidResponse['notification_in_app_error'] = (string) $outbid['notification_in_app_error'];
+    }
 
     bv_mobile_auction_json(200, [
         'ok' => true,
