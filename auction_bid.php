@@ -484,6 +484,291 @@ function bv_mobile_auction_count_existing_bids(PDO $pdo, int $listingId): int
     return (int) $stmt->fetchColumn();
 }
 
+
+function bv_mobile_auction_previous_highest_bid(PDO $pdo, int $listingId, array $listing): array
+{
+    $previousBidderUserId = null;
+    $previousBidAmount = null;
+    $previousBidId = null;
+
+    if (bv_mobile_auction_has_column($pdo, 'listings', 'auction_winner_user_id')) {
+        $winnerId = (int) ($listing['auction_winner_user_id'] ?? 0);
+        if ($winnerId > 0) {
+            $amount = bv_mobile_auction_decimal($listing['auction_current_bid'] ?? null);
+            if ($amount !== null && $amount > 0) {
+                $previousBidderUserId = $winnerId;
+                $previousBidAmount = bv_mobile_auction_money($amount);
+            }
+        }
+    }
+
+    $bidColumns = bv_mobile_auction_columns($pdo, 'listing_auction_bids');
+    $bidderColumn = isset($bidColumns['bidder_user_id']) ? 'bidder_user_id' : (isset($bidColumns['user_id']) ? 'user_id' : null);
+    if ($bidderColumn === null) {
+        return [
+            'previous_highest_bidder_user_id' => $previousBidderUserId,
+            'previous_highest_bid_amount' => $previousBidAmount,
+            'previous_bid_id' => $previousBidId,
+        ];
+    }
+
+    $select = [];
+    if (isset($bidColumns['id'])) {
+        $select[] = '`id`';
+    }
+    $select[] = '`' . $bidderColumn . '` AS `bidder_user_id`';
+    $select[] = '`bid_amount`';
+
+    $where = ['`listing_id` = :listing_id'];
+    if (isset($bidColumns['bid_status'])) {
+        $where[] = "(`bid_status` IS NULL OR `bid_status` NOT IN ('rejected', 'cancelled', 'canceled', 'void'))";
+    }
+
+    $order = ['`bid_amount` DESC'];
+    if (isset($bidColumns['created_at'])) {
+        $order[] = '`created_at` DESC';
+    }
+    if (isset($bidColumns['id'])) {
+        $order[] = '`id` DESC';
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT ' . implode(', ', $select)
+        . ' FROM `listing_auction_bids` WHERE ' . implode(' AND ', $where)
+        . ' ORDER BY ' . implode(', ', $order) . ' LIMIT 1'
+    );
+    $stmt->execute([':listing_id' => $listingId]);
+    $row = $stmt->fetch();
+
+    if ($row) {
+        $rowUserId = (int) ($row['bidder_user_id'] ?? 0);
+        $rowAmount = bv_mobile_auction_decimal($row['bid_amount'] ?? null);
+        if ($rowUserId > 0 && $rowAmount !== null && $rowAmount > 0) {
+            if ($previousBidderUserId === null || $previousBidAmount === null || $rowAmount >= $previousBidAmount - 0.00001) {
+                $previousBidderUserId = $rowUserId;
+                $previousBidAmount = bv_mobile_auction_money($rowAmount);
+                $previousBidId = isset($row['id']) ? (int) $row['id'] : null;
+            }
+        }
+    }
+
+    if ($previousBidderUserId !== null && $previousBidAmount !== null && $previousBidId === null && isset($bidColumns['id'])) {
+        $matchWhere = [
+            '`listing_id` = :listing_id',
+            '`' . $bidderColumn . '` = :bidder_user_id',
+            '`bid_amount` = :bid_amount',
+        ];
+        if (isset($bidColumns['bid_status'])) {
+            $matchWhere[] = "(`bid_status` IS NULL OR `bid_status` NOT IN ('rejected', 'cancelled', 'canceled', 'void'))";
+        }
+        $matchOrder = [];
+        if (isset($bidColumns['created_at'])) {
+            $matchOrder[] = '`created_at` DESC';
+        }
+        $matchOrder[] = '`id` DESC';
+        $stmt = $pdo->prepare(
+            'SELECT `id` FROM `listing_auction_bids` WHERE ' . implode(' AND ', $matchWhere)
+            . ' ORDER BY ' . implode(', ', $matchOrder) . ' LIMIT 1'
+        );
+        $stmt->execute([
+            ':listing_id' => $listingId,
+            ':bidder_user_id' => $previousBidderUserId,
+            ':bid_amount' => $previousBidAmount,
+        ]);
+        $matchedBidId = $stmt->fetchColumn();
+        if ($matchedBidId !== false && $matchedBidId !== null) {
+            $previousBidId = (int) $matchedBidId;
+        }
+    }
+
+    return [
+        'previous_highest_bidder_user_id' => $previousBidderUserId,
+        'previous_highest_bid_amount' => $previousBidAmount,
+        'previous_bid_id' => $previousBidId,
+    ];
+}
+
+function bv_mobile_auction_base_url(): string
+{
+    foreach (['BETTAVARO_BASE_URL', 'APP_URL', 'BASE_URL'] as $constant) {
+        if (defined($constant) && is_string(constant($constant)) && trim((string) constant($constant)) !== '') {
+            return rtrim(trim((string) constant($constant)), '/');
+        }
+    }
+
+    return 'https://www.bettavaro.com';
+}
+
+function bv_mobile_auction_listing_url(int $listingId, ?string $slug): string
+{
+    $base = bv_mobile_auction_base_url();
+    $cleanSlug = trim((string) $slug);
+    if ($cleanSlug !== '') {
+        return $base . '/listing.php?slug=' . urlencode($cleanSlug);
+    }
+    if ($listingId > 0) {
+        return $base . '/listing.php?id=' . $listingId;
+    }
+    return $base . '/listing.php';
+}
+
+function bv_mobile_auction_escape_html(string $value): string
+{
+    return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function bv_mobile_auction_outbid_recipient(PDO $pdo, int $userId): ?array
+{
+    if (!bv_mobile_auction_table_exists($pdo, 'users') || !bv_mobile_auction_has_column($pdo, 'users', 'id') || !bv_mobile_auction_has_column($pdo, 'users', 'email')) {
+        return null;
+    }
+
+    $columns = bv_mobile_auction_columns($pdo, 'users');
+    $select = ['`id`', '`email`'];
+    foreach (['account_status', 'status', 'is_active', 'active'] as $column) {
+        if (isset($columns[$column])) {
+            $select[] = bv_mobile_auction_ident($column);
+        }
+    }
+
+    $stmt = $pdo->prepare('SELECT ' . implode(', ', $select) . ' FROM `users` WHERE `id` = :id LIMIT 1');
+    $stmt->execute([':id' => $userId]);
+    $user = $stmt->fetch();
+    if (!$user) {
+        return null;
+    }
+
+    $email = trim((string) ($user['email'] ?? ''));
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return null;
+    }
+
+    foreach (['is_active', 'active'] as $column) {
+        if (array_key_exists($column, $user) && (int) $user[$column] !== 1) {
+            return null;
+        }
+    }
+
+    foreach (['account_status', 'status'] as $column) {
+        if (!array_key_exists($column, $user)) {
+            continue;
+        }
+        $status = strtolower(trim((string) $user[$column]));
+        if ($status !== '' && !in_array($status, ['active', 'verified', 'enabled'], true)) {
+            return null;
+        }
+    }
+
+    return ['id' => $userId, 'email' => $email];
+}
+
+function bv_mobile_auction_load_mail_queue_helper(): void
+{
+    $publicRoot = bv_mobile_auction_public_root();
+    $candidates = [
+        $publicRoot . '/includes/mail_queue.php',
+        $publicRoot . '/includes/mailer.php',
+        __DIR__ . '/mail_queue.php',
+        __DIR__ . '/mailer.php',
+    ];
+
+    foreach ($candidates as $file) {
+        if (is_file($file)) {
+            require_once $file;
+        }
+    }
+}
+
+function bv_mobile_auction_queue_outbid_email(PDO $pdo, array $context): bool
+{
+    try {
+        bv_mobile_auction_load_mail_queue_helper();
+
+        if (!function_exists('bv_queue_mail')) {
+            bv_mobile_auction_log('outbid_notification_skipped helper_unavailable listing_id=' . (int) ($context['listing_id'] ?? 0));
+            return false;
+        }
+
+        $recipient = bv_mobile_auction_outbid_recipient($pdo, (int) ($context['previous_bidder_user_id'] ?? 0));
+        if ($recipient === null) {
+            bv_mobile_auction_log('outbid_notification_skipped recipient_unavailable listing_id=' . (int) ($context['listing_id'] ?? 0));
+            return false;
+        }
+
+        $currency = (string) ($context['currency'] ?? 'USD');
+        $previousAmount = number_format((float) ($context['previous_bid_amount'] ?? 0), 2, '.', '');
+        $newAmount = number_format((float) ($context['new_bid_amount'] ?? 0), 2, '.', '');
+        $listingTitle = trim((string) ($context['listing_title'] ?? 'Auction listing'));
+        if ($listingTitle === '') {
+            $listingTitle = 'Auction listing';
+        }
+        $listingUrl = bv_mobile_auction_listing_url((int) ($context['listing_id'] ?? 0), isset($context['listing_slug']) ? (string) $context['listing_slug'] : null);
+
+        $subject = 'You have been outbid on Bettavaro';
+        $safeTitle = bv_mobile_auction_escape_html($listingTitle);
+        $safeCurrency = bv_mobile_auction_escape_html($currency);
+        $safeListingUrl = bv_mobile_auction_escape_html($listingUrl);
+
+        $html = '<!doctype html><html><body style="margin:0;padding:0;background:#f6f7f9;font-family:Arial,sans-serif;color:#111;">'
+            . '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f7f9;padding:20px 0;"><tr><td align="center">'
+            . '<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:24px;">'
+            . '<tr><td style="font-size:20px;font-weight:bold;color:#111;padding-bottom:12px;">You have been outbid</td></tr>'
+            . '<tr><td style="font-size:14px;line-height:1.5;color:#333;padding-bottom:12px;">Another bidder placed a higher bid on your Bettavaro auction.</td></tr>'
+            . '<tr><td><table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            . '<tr><td style="padding:8px 0;color:#666;width:160px;">Listing</td><td style="padding:8px 0;color:#111;">' . $safeTitle . '</td></tr>'
+            . '<tr><td style="padding:8px 0;color:#666;width:160px;">Your previous bid</td><td style="padding:8px 0;color:#111;">' . $safeCurrency . ' ' . $previousAmount . '</td></tr>'
+            . '<tr><td style="padding:8px 0;color:#666;width:160px;">New current bid</td><td style="padding:8px 0;color:#111;">' . $safeCurrency . ' ' . $newAmount . '</td></tr>'
+            . '</table></td></tr>'
+            . '<tr><td style="padding-top:20px;"><a href="' . $safeListingUrl . '" style="display:inline-block;background:#111;color:#fff;text-decoration:none;padding:10px 16px;border-radius:4px;font-size:14px;">Open auction and place a new bid</a></td></tr>'
+            . '</table></td></tr></table></body></html>';
+
+        $text = "You have been outbid on Bettavaro\n\n"
+            . 'Listing: ' . $listingTitle . "\n"
+            . 'Your previous bid: ' . $currency . ' ' . $previousAmount . "\n"
+            . 'New current bid: ' . $currency . ' ' . $newAmount . "\n"
+            . 'Open auction and place a new bid: ' . $listingUrl . "\n";
+
+        $payload = [
+            'queue_key' => 'auction_outbid_' . (int) ($context['listing_id'] ?? 0) . '_' . (int) ($context['bid_id'] ?? 0) . '_' . (int) ($context['previous_bidder_user_id'] ?? 0),
+            'to' => $recipient['email'],
+            'subject' => $subject,
+            'html' => $html,
+            'text' => $text,
+            'html_body' => $html,
+            'text_body' => $text,
+            'meta' => [
+                'event' => 'auction.outbid',
+                'listing_id' => (int) ($context['listing_id'] ?? 0),
+                'previous_bidder_user_id' => (int) ($context['previous_bidder_user_id'] ?? 0),
+                'new_bidder_user_id' => (int) ($context['new_bidder_user_id'] ?? 0),
+                'bid_id' => (int) ($context['bid_id'] ?? 0),
+            ],
+        ];
+
+        $result = bv_queue_mail($payload);
+        $queued = false;
+        if (is_bool($result)) {
+            $queued = $result;
+        } elseif (is_numeric($result)) {
+            $queued = ((int) $result) > 0;
+        } elseif (is_array($result)) {
+            $queued = (bool) ($result['ok'] ?? $result['success'] ?? $result['queued'] ?? false);
+        }
+
+        if ($queued) {
+            bv_mobile_auction_log('outbid_notification_queued listing_id=' . (int) ($context['listing_id'] ?? 0) . ' previous_bidder_user_id=' . (int) ($context['previous_bidder_user_id'] ?? 0) . ' bid_id=' . (int) ($context['bid_id'] ?? 0));
+            return true;
+        }
+
+        bv_mobile_auction_log('outbid_notification_failed queue_returned_false listing_id=' . (int) ($context['listing_id'] ?? 0) . ' previous_bidder_user_id=' . (int) ($context['previous_bidder_user_id'] ?? 0));
+        return false;
+    } catch (Throwable $e) {
+        bv_mobile_auction_log('outbid_notification_failed ' . $e->getMessage() . ' listing_id=' . (int) ($context['listing_id'] ?? 0));
+        return false;
+    }
+}
+
+
 try {
     if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
         bv_mobile_auction_error('method_not_allowed', 'Only POST requests are accepted.', 405);
@@ -621,6 +906,16 @@ try {
             422
         );
     }
+	
+   $previousHighest = bv_mobile_auction_previous_highest_bid($pdo, $listingId, $listing);
+    $previousHighestBidderUserId = $previousHighest['previous_highest_bidder_user_id'];
+    $previousHighestBidAmount = $previousHighest['previous_highest_bid_amount'];
+    $previousBidId = $previousHighest['previous_bid_id'];
+    $wasOutbid = $previousHighestBidderUserId !== null && (int) $previousHighestBidderUserId > 0 && (int) $previousHighestBidderUserId !== $userId;
+    if ($wasOutbid) {
+        bv_mobile_auction_log('outbid_detected listing_id=' . $listingId . ' previous_bidder_user_id=' . (int) $previousHighestBidderUserId . ' new_bidder_user_id=' . $userId);
+    }
+	
 
     $bidColumns = bv_mobile_auction_columns($pdo, 'listing_auction_bids');
     foreach (['listing_id', 'bid_amount'] as $requiredColumn) {
@@ -704,8 +999,40 @@ try {
     $bidCount = bv_mobile_auction_count_existing_bids($pdo, $listingId);
     $currency = (string) bv_mobile_auction_value($listing, $currencyColumn, 'USD');
     $nextMinBid = bv_mobile_auction_money($bidAmount + $increment);
+   $titleColumn = bv_mobile_auction_first_column($pdo, 'listings', ['title', 'name', 'listing_title']);
+    $slugColumn = bv_mobile_auction_first_column($pdo, 'listings', ['slug']);
+    $listingTitle = (string) bv_mobile_auction_value($listing, $titleColumn, 'Auction listing');
+    $listingSlug = $slugColumn !== null ? (string) bv_mobile_auction_value($listing, $slugColumn, '') : '';
+    $outbid = [
+        'was_outbid' => $wasOutbid,
+        'previous_highest_bidder_user_id' => $wasOutbid ? (int) $previousHighestBidderUserId : null,
+        'previous_highest_bid_amount' => $wasOutbid && $previousHighestBidAmount !== null ? bv_mobile_auction_money((float) $previousHighestBidAmount) : null,
+        'new_highest_bidder_user_id' => $userId,
+        'new_highest_bid_amount' => $bidAmount,
+        'notification_queued' => false,
+    ];
+    $outbidNotificationContext = null;
+    if ($wasOutbid) {
+        $outbidNotificationContext = [
+            'listing_id' => $listingId,
+            'listing_title' => $listingTitle,
+            'listing_slug' => $listingSlug,
+            'currency' => $currency,
+            'previous_bidder_user_id' => (int) $previousHighestBidderUserId,
+            'previous_bid_amount' => $previousHighestBidAmount !== null ? (float) $previousHighestBidAmount : 0.0,
+            'previous_bid_id' => $previousBidId,
+            'new_bidder_user_id' => $userId,
+            'new_bid_amount' => $bidAmount,
+            'bid_id' => $bidId,
+        ];
+    }	
 
     $pdo->commit();
+
+    if ($outbidNotificationContext !== null) {
+        $outbid['notification_queued'] = bv_mobile_auction_queue_outbid_email($pdo, $outbidNotificationContext);
+    }
+	
 
     bv_mobile_auction_json(200, [
         'ok' => true,
@@ -724,6 +1051,7 @@ try {
                 'bid_count' => $bidCount,
                 'ends_at' => is_string($endsAt) && trim($endsAt) !== '' ? $endsAt : null,
             ],
+            'outbid' => $outbid,			
         ],
     ]);
 } catch (BvMobileAuctionApiException $e) {
