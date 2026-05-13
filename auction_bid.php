@@ -1033,6 +1033,15 @@ try {
         $outbid['notification_queued'] = bv_mobile_auction_queue_outbid_email($pdo, $outbidNotificationContext);
     }
 	
+	
+   $outbidResponse = [
+        'was_outbid' => (bool) ($outbid['was_outbid'] ?? false),
+        'previous_highest_bidder_user_id' => isset($outbid['previous_highest_bidder_user_id']) ? (int) $outbid['previous_highest_bidder_user_id'] : null,
+        'previous_highest_bid_amount' => isset($outbid['previous_highest_bid_amount']) ? (float) $outbid['previous_highest_bid_amount'] : null,
+        'new_highest_bidder_user_id' => (int) ($outbid['new_highest_bidder_user_id'] ?? $userId),
+        'new_highest_bid_amount' => (float) ($outbid['new_highest_bid_amount'] ?? $bidAmount),
+        'notification_queued' => (bool) ($outbid['notification_queued'] ?? false),
+    ];	
 
     bv_mobile_auction_json(200, [
         'ok' => true,
@@ -1051,7 +1060,7 @@ try {
                 'bid_count' => $bidCount,
                 'ends_at' => is_string($endsAt) && trim($endsAt) !== '' ? $endsAt : null,
             ],
-            'outbid' => $outbid,			
+            'outbid' => $outbidResponse,		
         ],
     ]);
 } catch (BvMobileAuctionApiException $e) {
