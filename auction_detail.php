@@ -475,7 +475,7 @@ function bv_mobile_auction_detail_datetime(?string $value): ?DateTimeImmutable
     }
 
     try {
-        return new DateTimeImmutable($value, new DateTimeZone('UTC'));
+        return new DateTimeImmutable($value, new DateTimeZone('Asia/Bangkok'));
     } catch (Throwable $e) {
         bv_mobile_auction_detail_log('Invalid datetime value: ' . $value);
         return null;
@@ -659,7 +659,7 @@ try {
         $endsAtRaw = $listing['auction_ends_at'];
     }
 
-    $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    $now = new DateTimeImmutable('now', new DateTimeZone('Asia/Bangkok'));
     $startsAt = bv_mobile_auction_detail_datetime(is_string($startsAtRaw) ? $startsAtRaw : null);
     $endsAt = bv_mobile_auction_detail_datetime(is_string($endsAtRaw) ? $endsAtRaw : null);
     $auctionStatus = bv_mobile_auction_detail_derive_status($listing, $startsAt, $endsAt, $now);
