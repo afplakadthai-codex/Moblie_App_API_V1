@@ -728,7 +728,7 @@ function bv_mobile_auction_notify_bid_events(PDO $pdo, array $context): void
             $created = bv_mobile_auction_create_notification(
                 $pdo,
                 $previousBidderUserId,
-                'auction_outbid',
+                'auction.outbid',
                 'You have been outbid',
                 'Someone placed a higher bid on ' . $listingTitle . '.',
                 $url
