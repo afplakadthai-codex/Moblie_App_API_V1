@@ -629,6 +629,209 @@ function bv_mobile_auction_listing_path(int $listingId, ?string $slug): string
     return '/listing.php';
 }
 
+function bv_mobile_auction_notification_log(string $event, array $context = []): void
+{
+    $safeEvent = preg_replace('/[^A-Za-z0-9_.-]+/', '_', $event) ?: 'notification_event';
+    $parts = [$safeEvent];
+    foreach ($context as $key => $value) {
+        if (is_array($value) || is_object($value)) {
+            continue;
+        }
+        $safeKey = preg_replace('/[^A-Za-z0-9_.-]+/', '_', (string) $key) ?: 'context';
+        $safeValue = str_replace(["\r", "\n"], ' ', (string) $value);
+        $parts[] = $safeKey . '=' . $safeValue;
+    }
+    $message = implode(' ', $parts);
+
+    error_log('[BV Mobile Auction Notifications] ' . $message);
+
+    $logFile = bv_mobile_auction_public_root() . '/logs/mobile_auction_notifications.log';
+    $logDir = dirname($logFile);
+    if (!is_dir($logDir)) {
+        @mkdir($logDir, 0755, true);
+    }
+    if (is_dir($logDir) && is_writable($logDir)) {
+        @file_put_contents($logFile, gmdate('[Y-m-d H:i:s] ') . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+    }
+}
+
+function bv_mobile_auction_create_notification(PDO $pdo, int $userId, string $type, string $title, string $message, string $url): bool
+{
+    try {
+        if ($userId <= 0) {
+            bv_mobile_auction_notification_log('notification_skipped', [
+                'reason' => 'invalid_recipient',
+                'type' => $type,
+            ]);
+            return false;
+        }
+
+        if (!bv_mobile_auction_table_exists($pdo, 'notifications')) {
+            bv_mobile_auction_notification_log('notification_skipped', [
+                'reason' => 'notifications_table_missing',
+                'user_id' => $userId,
+                'type' => $type,
+            ]);
+            return false;
+        }
+
+        $columns = bv_mobile_auction_columns($pdo, 'notifications');
+        foreach (['user_id', 'type', 'title', 'message', 'url', 'is_read', 'created_at'] as $requiredColumn) {
+            if (!isset($columns[$requiredColumn])) {
+                bv_mobile_auction_notification_log('notification_skipped', [
+                    'reason' => 'notifications_' . $requiredColumn . '_column_missing',
+                    'user_id' => $userId,
+                    'type' => $type,
+                ]);
+                return false;
+            }
+        }
+
+        $stmt = $pdo->prepare(
+            'INSERT INTO `notifications` (`user_id`, `type`, `title`, `message`, `url`, `is_read`, `created_at`)'
+            . ' VALUES (:user_id, :type, :title, :message, :url, :is_read, NOW())'
+        );
+        $stmt->execute([
+            ':user_id' => $userId,
+            ':type' => $type,
+            ':title' => $title,
+            ':message' => $message,
+            ':url' => $url,
+            ':is_read' => 0,
+        ]);
+
+        return true;
+    } catch (Throwable $e) {
+        bv_mobile_auction_notification_log('notification_failed', [
+            'user_id' => $userId,
+            'type' => $type,
+            'error' => $e->getMessage(),
+        ]);
+        return false;
+    }
+}
+
+function bv_mobile_auction_notify_bid_events(PDO $pdo, array $context): void
+{
+    try {
+        $listingId = (int) ($context['listing_id'] ?? 0);
+        $listingTitle = trim((string) ($context['listing_title'] ?? ''));
+        if ($listingTitle === '') {
+            $listingTitle = 'your auction listing';
+        }
+        $url = $listingId > 0 ? '/listing.php?id=' . $listingId : '/listing.php';
+        $bidderUserId = (int) ($context['bidder_user_id'] ?? 0);
+        $previousBidderUserId = (int) ($context['previous_bidder_user_id'] ?? 0);
+        $sellerId = (int) ($context['seller_id'] ?? 0);
+
+        if ($previousBidderUserId > 0 && $previousBidderUserId !== $bidderUserId) {
+            $created = bv_mobile_auction_create_notification(
+                $pdo,
+                $previousBidderUserId,
+                'auction_outbid',
+                'You have been outbid',
+                'Someone placed a higher bid on ' . $listingTitle . '.',
+                $url
+            );
+            bv_mobile_auction_notification_log($created ? 'notification_outbid_created' : 'notification_failed', [
+                'listing_id' => $listingId,
+                'user_id' => $previousBidderUserId,
+                'bidder_user_id' => $bidderUserId,
+            ]);
+        } else {
+            bv_mobile_auction_notification_log('notification_skipped', [
+                'reason' => 'outbid_recipient_unavailable_or_same_bidder',
+                'listing_id' => $listingId,
+                'previous_bidder_user_id' => $previousBidderUserId,
+                'bidder_user_id' => $bidderUserId,
+            ]);
+        }
+
+        if ($sellerId > 0 && $sellerId !== $bidderUserId) {
+            $bidderName = trim((string) ($context['bidder_name'] ?? ''));
+            if ($bidderName === '') {
+                $bidderName = 'A buyer';
+            }
+            $currency = trim((string) ($context['currency'] ?? ''));
+            if ($currency === '') {
+                $currency = 'USD';
+            }
+            $bidAmount = number_format((float) ($context['bid_amount'] ?? 0), 2, '.', '');
+            $created = bv_mobile_auction_create_notification(
+                $pdo,
+                $sellerId,
+                'auction_new_bid',
+                'New auction bid received',
+                $bidderName . ' placed a bid of ' . $currency . ' ' . $bidAmount . ' on ' . $listingTitle . '.',
+                $url
+            );
+            bv_mobile_auction_notification_log($created ? 'notification_seller_bid_created' : 'notification_failed', [
+                'listing_id' => $listingId,
+                'user_id' => $sellerId,
+                'bidder_user_id' => $bidderUserId,
+            ]);
+        } else {
+            bv_mobile_auction_notification_log('notification_skipped', [
+                'reason' => 'seller_unavailable_or_same_bidder',
+                'listing_id' => $listingId,
+                'seller_id' => $sellerId,
+                'bidder_user_id' => $bidderUserId,
+            ]);
+        }
+    } catch (Throwable $e) {
+        bv_mobile_auction_notification_log('notification_failed', [
+            'listing_id' => (int) ($context['listing_id'] ?? 0),
+            'error' => $e->getMessage(),
+        ]);
+    }
+}
+
+function bv_mobile_auction_bidder_display_name(PDO $pdo, int $userId): string
+{
+    try {
+        if ($userId <= 0 || !bv_mobile_auction_table_exists($pdo, 'users') || !bv_mobile_auction_has_column($pdo, 'users', 'id')) {
+            return 'A buyer';
+        }
+
+        $columns = bv_mobile_auction_columns($pdo, 'users');
+        $select = ['`id`'];
+        foreach (['display_name', 'name', 'full_name', 'first_name', 'last_name', 'username'] as $column) {
+            if (isset($columns[$column])) {
+                $select[] = bv_mobile_auction_ident($column);
+            }
+        }
+        if (count($select) === 1) {
+            return 'A buyer';
+        }
+
+        $stmt = $pdo->prepare('SELECT ' . implode(', ', $select) . ' FROM `users` WHERE `id` = :id LIMIT 1');
+        $stmt->execute([':id' => $userId]);
+        $user = $stmt->fetch();
+        if (!$user) {
+            return 'A buyer';
+        }
+
+        foreach (['display_name', 'name', 'full_name', 'username'] as $column) {
+            $value = trim((string) ($user[$column] ?? ''));
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        $firstName = trim((string) ($user['first_name'] ?? ''));
+        $lastName = trim((string) ($user['last_name'] ?? ''));
+        $fullName = trim($firstName . ' ' . $lastName);
+        return $fullName !== '' ? $fullName : 'A buyer';
+    } catch (Throwable $e) {
+        bv_mobile_auction_notification_log('notification_skipped', [
+            'reason' => 'bidder_name_unavailable',
+            'user_id' => $userId,
+            'error' => $e->getMessage(),
+        ]);
+        return 'A buyer';
+    }
+}
+
 function bv_mobile_auction_create_outbid_in_app_notification(PDO $pdo, array $context): array
 {
     $listingId = (int) ($context['listing_id'] ?? 0);
@@ -1080,10 +1283,25 @@ try {
     $bidCount = bv_mobile_auction_count_existing_bids($pdo, $listingId);
     $currency = (string) bv_mobile_auction_value($listing, $currencyColumn, 'USD');
     $nextMinBid = bv_mobile_auction_money($bidAmount + $increment);
-   $titleColumn = bv_mobile_auction_first_column($pdo, 'listings', ['title', 'name', 'listing_title']);
+    $titleColumn = bv_mobile_auction_first_column($pdo, 'listings', ['title', 'name', 'listing_title']);  
     $slugColumn = bv_mobile_auction_first_column($pdo, 'listings', ['slug']);
     $listingTitle = (string) bv_mobile_auction_value($listing, $titleColumn, 'Auction listing');
     $listingSlug = $slugColumn !== null ? (string) bv_mobile_auction_value($listing, $slugColumn, '') : '';
+    $notificationListingTitle = trim($listingTitle);
+    if ($notificationListingTitle === '') {
+        $notificationListingTitle = 'your auction listing';
+    }
+    $bidNotificationContext = [
+        'listing_id' => $listingId,
+        'listing_title' => $notificationListingTitle,
+        'seller_id' => $sellerId,
+        'bidder_user_id' => $userId,
+        'bidder_name' => bv_mobile_auction_bidder_display_name($pdo, $userId),
+        'bid_amount' => $bidAmount,
+        'currency' => $currency,
+        'previous_bidder_user_id' => $previousHighestBidderUserId !== null ? (int) $previousHighestBidderUserId : 0,
+        'previous_bid_amount' => $previousHighestBidAmount !== null ? (float) $previousHighestBidAmount : 0.0,
+    ];	
     $outbid = [
         'was_outbid' => $wasOutbid,
         'previous_highest_bidder_user_id' => $wasOutbid ? (int) $previousHighestBidderUserId : null,
@@ -1092,13 +1310,13 @@ try {
         'new_highest_bid_amount' => $bidAmount,
         'notification_queued' => false,
         'notification_in_app_created' => false,
-        'notification_in_app_error' => null,	
+        'notification_in_app_error' => null,
     ];
     $outbidNotificationContext = null;
     if ($wasOutbid) {
         $outbidNotificationContext = [
             'listing_id' => $listingId,
-            'listing_title' => $listingTitle,
+            'listing_title' => $notificationListingTitle,
             'listing_slug' => $listingSlug,
             'currency' => $currency,
             'previous_bidder_user_id' => (int) $previousHighestBidderUserId,
@@ -1106,6 +1324,10 @@ try {
             'previous_bid_id' => $previousBidId,
             'new_bidder_user_id' => $userId,
             'new_bid_amount' => $bidAmount,
+            'bidder_user_id' => $userId,
+            'bid_amount' => $bidAmount,
+            'seller_id' => $sellerId,
+            'bidder_name' => $bidNotificationContext['bidder_name'],			
             'bid_id' => $bidId,
         ];
     }
@@ -1114,14 +1336,17 @@ try {
 
     if ($outbidNotificationContext !== null) {
         $outbid['notification_queued'] = bv_mobile_auction_queue_outbid_email($pdo, $outbidNotificationContext);
-         $inAppNotification = bv_mobile_auction_create_outbid_in_app_notification($pdo, $outbidNotificationContext);
-        $outbid['notification_in_app_created'] = (bool) ($inAppNotification['created'] ?? false);
-        if (!empty($inAppNotification['error'])) {
-            $outbid['notification_in_app_error'] = (string) $inAppNotification['error'];
-        }  
+
     } else {
-        bv_mobile_auction_log('outbid_in_app_notification_skipped no_outbid listing_id=' . $listingId);		
+        bv_mobile_auction_notification_log('notification_skipped', [
+            'reason' => 'no_previous_outbid',
+            'listing_id' => $listingId,
+            'bidder_user_id' => $userId,
+        ]); 
     }
+
+
+    bv_mobile_auction_notify_bid_events($pdo, $bidNotificationContext);
 	
 	
    $outbidResponse = [
