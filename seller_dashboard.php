@@ -98,17 +98,12 @@ if (!function_exists('bv_sd_db')) {
         }
 
         $loaded = true;
-        $publicRoot = bv_sd_public_root();
-        $projectRoot = bv_sd_project_root();
+         $publicRoot = bv_sd_public_root();
         $candidates = [
             $publicRoot . '/config/db.php',
             $publicRoot . '/includes/db.php',
             $publicRoot . '/includes/config.php',
-            $projectRoot . '/config/db.php',
-            $projectRoot . '/includes/db.php',
-            $projectRoot . '/includes/config.php',
-            $projectRoot . '/db.php',
-            $projectRoot . '/config.php',
+            dirname($publicRoot) . '/config/db.php',
         ];
 
         foreach ($candidates as $path) {
@@ -133,18 +128,16 @@ if (!function_exists('bv_sd_db')) {
                 );
             };
 
-            try {
-                $vars = $loader($path);
-            } catch (Throwable $e) {
-                bv_sd_log('Config include failed: ' . $e->getMessage());
-                continue;
-            }
+         $vars = $loader($path);
 
             foreach (['pdo', 'conn', 'db', 'mysqli', 'link'] as $name) {
                 if (isset($vars[$name]) && ($vars[$name] instanceof PDO || $vars[$name] instanceof mysqli)) {
                     $connection = $vars[$name];
                     return $connection;
                 }
+            }
+
+            foreach (['pdo', 'conn', 'db', 'mysqli', 'link'] as $name) {
                 if (isset($GLOBALS[$name]) && ($GLOBALS[$name] instanceof PDO || $GLOBALS[$name] instanceof mysqli)) {
                     $connection = $GLOBALS[$name];
                     return $connection;
@@ -347,26 +340,24 @@ if (!function_exists('bv_sd_columns')) {
         if (array_key_exists($key, $cache)) {
             return $cache[$key];
         }
-        if (!preg_match('/^[A-Za-z0-9_]+$/', $table) || !bv_sd_table_exists($db, $table)) {
-            $cache[$key] = null;
-            return null;
-        }
 
         try {
             $rows = bv_sd_fetch_all($db, 'SHOW COLUMNS FROM ' . bv_sd_ident($table));
-            $columns = [];
-            foreach ($rows as $row) {
-                if (isset($row['Field'])) {
-                    $columns[strtolower((string) $row['Field'])] = (string) $row['Field'];
-                }
-            }
-            $cache[$key] = $columns;
-            return $columns;
         } catch (Throwable $e) {
             bv_sd_log('Column detection failed for ' . $table . ': ' . $e->getMessage());
             $cache[$key] = null;
             return null;
         }
+
+        $columns = [];
+        foreach ($rows as $row) {
+            if (isset($row['Field'])) {
+                $columns[strtolower((string) $row['Field'])] = (string) $row['Field'];
+            }
+        }
+
+        $cache[$key] = $columns;
+        return $columns;
     }
 }
 
@@ -561,34 +552,27 @@ try {
     }
 
     $tokenHash = hash('sha256', $plainToken);
-    $tokenPredicates = [];
+    $tokenPredicate = null;
     $tokenParams = [];
     if (bv_sd_has_col($tokenColumns, 'token_hash')) {
-        $tokenPredicates[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'token_hash')) . ' = ?';
+        $tokenPredicate = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'token_hash')) . ' = ?';
         $tokenParams[] = $tokenHash;
-    }
-    if (bv_sd_has_col($tokenColumns, 'token')) {
-        $tokenPredicates[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'token')) . ' IN (?, ?)';
+    } elseif (bv_sd_has_col($tokenColumns, 'token')) {
+        $tokenPredicate = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'token')) . ' = ?';
         $tokenParams[] = $tokenHash;
+    } elseif (bv_sd_has_col($tokenColumns, 'plain_token')) {
+        $tokenPredicate = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'plain_token')) . ' = ?';
         $tokenParams[] = $plainToken;
-    }
-    if (bv_sd_has_col($tokenColumns, 'plain_token')) {
-        $tokenPredicates[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'plain_token')) . ' = ?';
-        $tokenParams[] = $plainToken;
-    }
-    if (!$tokenPredicates) {
+    } else {
         bv_sd_error('server_error', 'Token table is not configured correctly.', 500);
     }
 
-    $where = ['(' . implode(' OR ', $tokenPredicates) . ')'];
+    $where = [$tokenPredicate];
     if (bv_sd_has_col($tokenColumns, 'revoked_at')) {
         $where[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'revoked_at')) . ' IS NULL';
     }
-    if (bv_sd_has_col($tokenColumns, 'revoked')) {
-        $where[] = 'COALESCE(mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'revoked')) . ', 0) = 0';
-    }
-    if (bv_sd_has_col($tokenColumns, 'is_revoked')) {
-        $where[] = 'COALESCE(mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'is_revoked')) . ', 0) = 0';
+    if (bv_sd_has_col($tokenColumns, 'expires_at')) {
+        $where[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'expires_at')) . ' > NOW()';
     }
 
     $userSelectWanted = ['id', 'first_name', 'last_name', 'name', 'email', 'phone', 'role', 'account_status', 'status'];
@@ -648,10 +632,9 @@ try {
                     [bv_sd_int_value($authRow['__token_id'])]
                 );
             } else {
-                $updateWhere = array_map(static fn(string $predicate): string => str_replace('mat.', '', $predicate), $where);
-                bv_sd_execute(
+                 bv_sd_execute(
                     $db,
-                    'UPDATE ' . bv_sd_ident('mobile_auth_tokens') . ' SET ' . bv_sd_ident(bv_sd_col($tokenColumns, 'last_used_at')) . ' = NOW() WHERE ' . implode(' AND ', $updateWhere) . ' LIMIT 1',
+                    'UPDATE ' . bv_sd_ident('mobile_auth_tokens') . ' SET ' . bv_sd_ident(bv_sd_col($tokenColumns, 'last_used_at')) . ' = NOW() WHERE ' . str_replace('mat.', '', $tokenPredicate) . ' LIMIT 1',
                     $tokenParams
                 );
             }
