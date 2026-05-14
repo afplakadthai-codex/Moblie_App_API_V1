@@ -742,7 +742,7 @@ try {
     $recentListings = [];
 
     $listingColumns = bv_sd_columns($db, 'listings');
-    $listingSellerCol = bv_sd_first_col($listingColumns, ['seller_id', 'seller_user_id', 'user_id']);
+    $listingSellerCol = bv_sd_first_col($listingColumns, ['seller_id', 'seller_user_id', 'user_id', 'owner_user_id']);
     $listingIdCol = bv_sd_col($listingColumns, 'id');
 
     if ($listingColumns !== null && $listingSellerCol !== null && $listingIdCol !== null) {
@@ -800,15 +800,21 @@ try {
 
     $orderColumns = bv_sd_columns($db, 'orders');
     $orderItemColumns = bv_sd_columns($db, 'order_items');
-    $hasOrderChain = $orderColumns !== null && $orderItemColumns !== null && $listingColumns !== null && $listingSellerCol !== null && $listingIdCol !== null && bv_sd_has_col($orderColumns, 'id') && bv_sd_has_col($orderItemColumns, 'order_id') && bv_sd_has_col($orderItemColumns, 'listing_id');
+    $orderIdCol = bv_sd_col($orderColumns, 'id');
+    $itemOrderCol = bv_sd_col($orderItemColumns, 'order_id');
+    $itemListingCol = bv_sd_col($orderItemColumns, 'listing_id');
+    $itemIdCol = bv_sd_col($orderItemColumns, 'id');
+    $itemSellerCol = bv_sd_first_col($orderItemColumns, ['seller_id', 'seller_user_id']);
+    $hasListingOrderChain = $orderColumns !== null && $orderItemColumns !== null && $listingColumns !== null && $listingSellerCol !== null && $listingIdCol !== null && $orderIdCol !== null && $itemOrderCol !== null && $itemListingCol !== null;
+    $hasDirectItemOwnership = $orderColumns !== null && $orderItemColumns !== null && $orderIdCol !== null && $itemOrderCol !== null && $itemSellerCol !== null;
+    $hasOrderOwnership = $hasListingOrderChain || $hasDirectItemOwnership;
 
-    if ($hasOrderChain) {
-        $orderIdCol = bv_sd_col($orderColumns, 'id');
-        $itemOrderCol = bv_sd_col($orderItemColumns, 'order_id');
-        $itemListingCol = bv_sd_col($orderItemColumns, 'listing_id');
-        $itemIdCol = bv_sd_col($orderItemColumns, 'id');
-
-        $baseJoin = ' FROM ' . bv_sd_ident('orders') . ' o INNER JOIN ' . bv_sd_ident('order_items') . ' oi ON oi.' . bv_sd_ident($itemOrderCol) . ' = o.' . bv_sd_ident($orderIdCol) . ' INNER JOIN ' . bv_sd_ident('listings') . ' l ON l.' . bv_sd_ident($listingIdCol) . ' = oi.' . bv_sd_ident($itemListingCol) . ' WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ?';
+    if ($hasOrderOwnership) {
+        if ($hasListingOrderChain) {
+            $baseJoin = ' FROM ' . bv_sd_ident('orders') . ' o INNER JOIN ' . bv_sd_ident('order_items') . ' oi ON oi.' . bv_sd_ident($itemOrderCol) . ' = o.' . bv_sd_ident($orderIdCol) . ' INNER JOIN ' . bv_sd_ident('listings') . ' l ON l.' . bv_sd_ident($listingIdCol) . ' = oi.' . bv_sd_ident($itemListingCol) . ' WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ?';
+        } else {
+            $baseJoin = ' FROM ' . bv_sd_ident('orders') . ' o INNER JOIN ' . bv_sd_ident('order_items') . ' oi ON oi.' . bv_sd_ident($itemOrderCol) . ' = o.' . bv_sd_ident($orderIdCol) . ' WHERE oi.' . bv_sd_ident($itemSellerCol) . ' = ?';
+        }
 
         $summary['total_orders'] = bv_sd_count($db, 'SELECT COUNT(DISTINCT o.' . bv_sd_ident($orderIdCol) . ')' . $baseJoin, [$userId]);
 
@@ -854,18 +860,23 @@ try {
         $orderStatusExpr = bv_sd_select_expr($orderColumns, ['status'], 'o');
         $paymentStatusExpr = bv_sd_select_expr($orderColumns, ['payment_status'], 'o');
         $orderCurrencyExpr = bv_sd_select_expr($orderColumns, ['currency'], 'o', "'USD'");
-        $orderTotalExpr = bv_sd_select_expr($orderColumns, ['total', 'grand_total', 'total_amount', 'amount'], 'o', '0');
+ 
         $orderCreatedExpr = bv_sd_select_expr($orderColumns, ['created_at', 'ordered_at', 'updated_at'], 'o');
         $orderPaidExpr = bv_sd_select_expr($orderColumns, ['paid_at', 'payment_paid_at'], 'o');
         $orderSortCol = bv_sd_first_col($orderColumns, ['created_at', 'ordered_at', 'updated_at', 'id']);
-        $firstTitleExpr = bv_sd_select_expr($listingColumns, ['title', 'name'], 'l');
-        $firstImageExpr = bv_sd_select_expr($listingColumns, ['cover_image', 'image_url', 'image', 'photo_url', 'thumbnail_url'], 'l');
-        $fulfillmentSummaryExpr = $fulfillmentCol !== null ? 'GROUP_CONCAT(DISTINCT oi.' . bv_sd_ident($fulfillmentCol) . ' ORDER BY oi.' . bv_sd_ident($fulfillmentCol) . ' SEPARATOR \', \')' : $orderStatusExpr;
+        if ($hasListingOrderChain) {
+            $firstTitleExpr = bv_sd_select_expr($listingColumns, ['title', 'name'], 'l');
+            $firstImageExpr = bv_sd_select_expr($listingColumns, ['cover_image', 'image_url', 'image', 'photo_url', 'thumbnail_url'], 'l');
+        } else {
+            $firstTitleExpr = bv_sd_select_expr($orderItemColumns, ['title', 'item_title', 'listing_title', 'name'], 'oi');
+            $firstImageExpr = bv_sd_select_expr($orderItemColumns, ['image_url', 'cover_image', 'image', 'photo_url', 'thumbnail_url'], 'oi');
+        }
+        $fulfillmentSummaryExpr = $fulfillmentCol !== null ? 'GROUP_CONCAT(DISTINCT oi.' . bv_sd_ident($fulfillmentCol) . ' ORDER BY oi.' . bv_sd_ident($fulfillmentCol) . ' SEPARATOR \', \')' : 'MAX(' . $orderStatusExpr . ')'; 
 
         try {
             $rows = bv_sd_fetch_all(
                 $db,
-                'SELECT o.' . bv_sd_ident($orderIdCol) . ' AS id, ' . $orderCodeExpr . ' AS order_code, ' . $orderStatusExpr . ' AS status, ' . $paymentStatusExpr . ' AS payment_status, ' . $orderCurrencyExpr . ' AS currency, ' . $orderTotalExpr . ' AS total, COALESCE(SUM(' . $lineTotalExpr . '), 0) AS seller_subtotal, COALESCE(SUM(' . $qtyExpr . '), COUNT(*)) AS item_count, MIN(' . $firstTitleExpr . ') AS first_title, MIN(' . $firstImageExpr . ') AS first_image_url, ' . $orderCreatedExpr . ' AS created_at, ' . $orderPaidExpr . ' AS paid_at, ' . $fulfillmentSummaryExpr . ' AS fulfillment_status_summary' . $baseJoin . ' GROUP BY o.' . bv_sd_ident($orderIdCol) . ' ORDER BY o.' . bv_sd_ident($orderSortCol ?? $orderIdCol) . ' DESC LIMIT 5',
+               'SELECT o.' . bv_sd_ident($orderIdCol) . ' AS id, MAX(' . $orderCodeExpr . ') AS order_code, MAX(' . $orderStatusExpr . ') AS status, MAX(' . $paymentStatusExpr . ') AS payment_status, MAX(' . $orderCurrencyExpr . ') AS currency, COALESCE(SUM(' . $lineTotalExpr . '), 0) AS total, COALESCE(SUM(' . $lineTotalExpr . '), 0) AS seller_subtotal, COALESCE(SUM(' . $qtyExpr . '), COUNT(*)) AS item_count, MIN(' . $firstTitleExpr . ') AS first_title, MIN(' . $firstImageExpr . ') AS first_image_url, MAX(' . $orderCreatedExpr . ') AS created_at, MAX(' . $orderPaidExpr . ') AS paid_at, ' . $fulfillmentSummaryExpr . ' AS fulfillment_status_summary' . $baseJoin . ' GROUP BY o.' . bv_sd_ident($orderIdCol) . ' ORDER BY MAX(o.' . bv_sd_ident($orderSortCol ?? $orderIdCol) . ') DESC LIMIT 5',
                 [$userId]
             );
             foreach ($rows as $row) {
@@ -892,7 +903,7 @@ try {
 
         $refundColumns = bv_sd_columns($db, 'order_refunds');
         $refundItemColumns = bv_sd_columns($db, 'order_refund_items');
-        if ($refundColumns !== null && $refundItemColumns !== null && bv_sd_has_col($refundColumns, 'id') && bv_sd_has_col($refundItemColumns, 'refund_id') && bv_sd_has_col($refundItemColumns, 'order_item_id') && $itemIdCol !== null) {
+          if ($hasListingOrderChain && $refundColumns !== null && $refundItemColumns !== null && bv_sd_has_col($refundColumns, 'id') && bv_sd_has_col($refundItemColumns, 'refund_id') && bv_sd_has_col($refundItemColumns, 'order_item_id') && $itemIdCol !== null) {
             $params = [$userId];
             $refundStatusSql = '';
             if (bv_sd_has_col($refundColumns, 'status')) {
@@ -907,10 +918,16 @@ try {
     }
 
     $offerColumns = bv_sd_columns($db, 'listing_offers');
-    if ($offerColumns !== null && bv_sd_has_col($offerColumns, 'seller_user_id')) {
+    if ($offerColumns !== null) {
+        $offerSellerCol = bv_sd_first_col($offerColumns, ['seller_user_id', 'seller_id']);
+        $offerListingCol = bv_sd_col($offerColumns, 'listing_id');
         $params = [$userId];
         $statusSql = bv_sd_has_col($offerColumns, 'status') ? ' AND ' . bv_sd_status_where('lo', bv_sd_col($offerColumns, 'status'), ['open', 'seller_countered', 'buyer_countered', 'seller_accepted', 'buyer_checkout_ready'], $params) : '';
-        $summary['open_offers'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listing_offers') . ' lo WHERE lo.' . bv_sd_ident(bv_sd_col($offerColumns, 'seller_user_id')) . ' = ?' . $statusSql, $params);
+        if ($offerSellerCol !== null) {
+            $summary['open_offers'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listing_offers') . ' lo WHERE lo.' . bv_sd_ident($offerSellerCol) . ' = ?' . $statusSql, $params);
+        } elseif ($offerListingCol !== null && $listingColumns !== null && $listingIdCol !== null && $listingSellerCol !== null) {
+            $summary['open_offers'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listing_offers') . ' lo INNER JOIN ' . bv_sd_ident('listings') . ' l ON l.' . bv_sd_ident($listingIdCol) . ' = lo.' . bv_sd_ident($offerListingCol) . ' WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ?' . $statusSql, $params);
+        }
     }
 
     $alerts = [];
