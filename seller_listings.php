@@ -5,11 +5,20 @@ declare(strict_types=1);
 // Bettavaro Mobile API v1 — /api/mobile/v1/seller_listings.php
 // Authenticated seller endpoint: returns listings owned by the token holder.
 //
+// PATCH LOG (mobile-v1 spec alignment):
+//  - Added CORS headers + OPTIONS 204 preflight
+//  - Param: limit→per_page (max 100), q→search
+//  - Error code: listings_table_missing (was db_unavailable)
+//  - Status filter: inactive→hidden mapping
+//  - Listing fields renamed: cover_image→image_url, sex→gender
+//  - Added views/favorites (0, no DB col), stock_quantity (flat int)
+//  - avg_rating / sold_count sourced from listing_ranking_cache
+//  - Response: items→listings, stats→summary, added filters key
+//  - Summary keys: {total, active, draft, sold, inactive} (inactive=hidden)
+//  - meta.api_version = "mobile-v1"
+//
 // CRITICAL: Never touches $_SESSION. Never outputs HTML. Never redirects.
 // Does NOT interfere with the website session-based login in login.php.
-//
-// CORS: Not opened broadly. Configure Access-Control-Allow-Origin later
-//       when mobile app domain or API gateway is finalized.
 // =============================================================================
 
 while (ob_get_level() > 0) {
@@ -19,6 +28,15 @@ while (ob_get_level() > 0) {
 header('Content-Type: application/json; charset=UTF-8');
 header('X-Content-Type-Options: nosniff');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Access-Control-Allow-Methods: GET, OPTIONS');
+
+// ── OPTIONS preflight ─────────────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     http_response_code(405);
@@ -315,19 +333,6 @@ if (!function_exists('bv_seller_listings_listing_url')) {
     }
 }
 
-if (!function_exists('bv_seller_listings_money')) {
-    function bv_seller_listings_money($amount, string $currency): array
-    {
-        $amt      = bv_seller_listings_float($amount, 0.0);
-        $currency = strtoupper(trim($currency ?: 'USD'));
-        return [
-            'amount'    => $amt,
-            'currency'  => $currency,
-            'formatted' => $currency . ' ' . number_format($amt, 2),
-        ];
-    }
-}
-
 if (!function_exists('bv_seller_listings_read_bearer')) {
     function bv_seller_listings_read_bearer(): string
     {
@@ -526,12 +531,10 @@ try {
         [(int) $tokenRow['token_id']]
     );
 
-    $userId   = (int) $tokenRow['user_id'];
-    $userRole = bv_seller_listings_clean_string($tokenRow['role'] ?? 'user');
-    $firstName = bv_seller_listings_clean_string($tokenRow['first_name'] ?? '');
-    $lastName  = bv_seller_listings_clean_string($tokenRow['last_name']  ?? '');
+    $userId    = (int) $tokenRow['user_id'];
+    $userRole  = bv_seller_listings_clean_string($tokenRow['role'] ?? 'user');
 
-    // ── Require seller or admin ───────────────────────────────────────────────
+    // ── Permission: seller or admin only ──────────────────────────────────────
     if (!in_array($userRole, ['seller', 'admin'], true)) {
         bv_seller_listings_error('seller_required', 'Seller access is required.', 403);
     }
@@ -539,7 +542,7 @@ try {
     // ── Confirm listings table ────────────────────────────────────────────────
     if (!bv_seller_listings_table_exists($db, 'listings')) {
         bv_seller_listings_log('listings table not found.');
-        bv_seller_listings_error('db_unavailable', 'Service temporarily unavailable.', 503);
+        bv_seller_listings_error('listings_table_missing', 'Listings service is unavailable.', 503);
     }
 
     // ── Detect listings columns ───────────────────────────────────────────────
@@ -559,7 +562,7 @@ try {
         bv_seller_listings_error('db_unavailable', 'Service temporarily unavailable.', 503);
     }
 
-    // Determine effective seller user id to filter by
+    // Effective seller id (admin can scope to another seller via ?seller_id=)
     $filterUserId = $userId;
     if ($userRole === 'admin') {
         $rawAdminSellerId = bv_seller_listings_int($_GET['seller_id'] ?? 0, 0);
@@ -568,53 +571,47 @@ try {
         }
     }
 
-    // Cover image column
+    // Cover image column detection: cover_image → image → photo → thumbnail
     $coverCol = null;
-    foreach (['cover_image', 'image', 'image_path', 'main_image', 'thumbnail'] as $cand) {
+    foreach (['cover_image', 'image_url', 'image', 'photo', 'thumbnail'] as $cand) {
         if ($hasLCol($cand)) { $coverCol = $cand; break; }
     }
 
-    // Color column name varies
-    $colorCol = $hasLCol('color_pattern') ? 'color_pattern' : ($hasLCol('color') ? 'color' : null);
-
     // ── Parse query parameters ────────────────────────────────────────────────
-    $page    = max(1, bv_seller_listings_int($_GET['page']  ?? 1, 1));
-    $limit   = min(50, max(1, bv_seller_listings_int($_GET['limit'] ?? 20, 20)));
-    $offset  = ($page - 1) * $limit;
+    // Spec params: status, page, per_page, search
+    $page    = max(1, bv_seller_listings_int($_GET['page']     ?? 1, 1));
+    $perPage = min(100, max(1, bv_seller_listings_int($_GET['per_page'] ?? 20, 20)));
+    $offset  = ($page - 1) * $perPage;
+    $search  = trim((string) ($_GET['search'] ?? ''));
 
-    $qSearch     = trim((string) ($_GET['q']           ?? ''));
-    $qSort       = trim((string) ($_GET['sort']        ?? 'newest'));
-    $qStatus     = trim((string) ($_GET['status']      ?? 'all'));
-    $qSaleStatus = trim((string) ($_GET['sale_status'] ?? 'all'));
-
-    $allowedStatuses     = ['all', 'draft', 'pending', 'active', 'published', 'available', 'hidden', 'sold', 'reserved'];
-    $allowedSaleStatuses = ['all', 'available', 'reserved', 'sold'];
-    $allowedSorts        = ['newest', 'oldest', 'price_low', 'price_high', 'status'];
-
-    if (!in_array($qStatus,     $allowedStatuses,     true)) { $qStatus     = 'all'; }
-    if (!in_array($qSaleStatus, $allowedSaleStatuses, true)) { $qSaleStatus = 'all'; }
-    if (!in_array($qSort,       $allowedSorts,        true)) { $qSort       = 'newest'; }
+    // Status filter — spec supported values: all, active, draft, sold, inactive, pending
+    // "inactive" maps to DB value "hidden"
+    $qStatus = trim((string) ($_GET['status'] ?? 'all'));
+    $allowedStatuses = ['all', 'active', 'draft', 'sold', 'inactive', 'pending'];
+    if (!in_array($qStatus, $allowedStatuses, true)) {
+        $qStatus = 'all';
+    }
+    // Translate spec status → DB enum value
+    $dbStatusFilter = match ($qStatus) {
+        'inactive' => 'hidden',
+        default    => $qStatus,
+    };
 
     // ── Build WHERE clause ────────────────────────────────────────────────────
-    // All column references are qualified with the l. alias used in FROM listings l,
-    // preventing ambiguity when ranking/review JOINs are present.
     $whereParts  = ["l.`{$ownerCol}` = ?"];
     $whereParams = [$filterUserId];
 
     if ($qStatus !== 'all' && $hasLCol('status')) {
         $whereParts[]  = 'l.`status` = ?';
-        $whereParams[] = $qStatus;
+        $whereParams[] = $dbStatusFilter;
     }
-    if ($qSaleStatus !== 'all' && $hasLCol('sale_status')) {
-        $whereParts[]  = 'l.`sale_status` = ?';
-        $whereParams[] = $qSaleStatus;
-    }
-    if ($qSearch !== '') {
+
+    if ($search !== '') {
         $searchParts = [];
         foreach (['title', 'slug', 'species', 'strain'] as $sc) {
             if ($hasLCol($sc)) {
                 $searchParts[] = "l.`{$sc}` LIKE ?";
-                $whereParams[] = '%' . $qSearch . '%';
+                $whereParams[] = '%' . $search . '%';
             }
         }
         if (!empty($searchParts)) {
@@ -624,92 +621,91 @@ try {
 
     $whereSQL = 'WHERE ' . implode(' AND ', $whereParts);
 
-    // ── Optional table detection ──────────────────────────────────────────────
-    $hasRanking    = bv_seller_listings_table_exists($db, 'listing_ranking_scores');
-    $hasRankCache  = !$hasRanking && bv_seller_listings_table_exists($db, 'listing_ranking_cache');
-    $hasReviews    = bv_seller_listings_table_exists($db, 'listing_reviews');
-
-    $rvRatingCol    = null;
-    $rvStatusCol    = null;
-    $rvListingIdCol = null;
-    if ($hasReviews) {
-        $rvCols = bv_seller_listings_columns($db, 'listing_reviews');
-        foreach (['rating', 'score', 'stars'] as $c) {
-            if (in_array($c, $rvCols, true)) { $rvRatingCol = $c; break; }
-        }
-        foreach (['status', 'approved', 'is_approved'] as $c) {
-            if (in_array($c, $rvCols, true)) { $rvStatusCol = $c; break; }
-        }
-        foreach (['listing_id', 'item_id'] as $c) {
-            if (in_array($c, $rvCols, true)) { $rvListingIdCol = $c; break; }
-        }
-        if (!$rvRatingCol || !$rvListingIdCol) {
-            $hasReviews = false;
-        }
+    // ── Optional ranking cache table detection ────────────────────────────────
+    // listing_ranking_cache carries avg_rating and sold_count
+    $hasRankCache = bv_seller_listings_table_exists($db, 'listing_ranking_cache');
+    $rcListingCol = null;
+    $rcAvgCol     = null;
+    $rcSoldCol    = null;
+    if ($hasRankCache) {
+        $rcCols       = bv_seller_listings_columns($db, 'listing_ranking_cache');
+        $rcListingCol = in_array('listing_id', $rcCols, true) ? 'listing_id' : null;
+        $rcAvgCol     = in_array('avg_rating',   $rcCols, true) ? 'avg_rating'  : null;
+        $rcSoldCol    = in_array('sold_count',   $rcCols, true) ? 'sold_count'  : null;
+        if (!$rcListingCol) { $hasRankCache = false; }
     }
 
     // ── Build SELECT ──────────────────────────────────────────────────────────
     $selectCols = ['l.id'];
-    foreach (['title','slug','price','currency','status','sale_status','sale_format',
-              'species','strain','grade','sex','tail_type',
-              'stock_total','stock_sold','stock_available',
-              'created_at','updated_at'] as $col) {
-        if ($hasLCol($col)) { $selectCols[] = "l.{$col}"; }
-    }
-    if ($coverCol) {
-        $selectCols[] = "l.{$coverCol} AS cover_image";
-    }
-    if ($colorCol) {
-        $selectCols[] = "l.{$colorCol} AS color";
+
+    // Core spec fields
+    foreach (['title', 'slug', 'status', 'sale_status', 'species', 'strain'] as $col) {
+        if ($hasLCol($col)) { $selectCols[] = "l.`{$col}`"; }
     }
 
-    // Ranking score
-    if ($hasRanking) {
-        $selectCols[] = 'COALESCE(lrs.final_score, 0) AS ranking_score';
-    } elseif ($hasRankCache) {
-        $rankScoreCol = bv_seller_listings_has_col($db, 'listing_ranking_cache', 'final_score')
-            ? 'final_score'
-            : (bv_seller_listings_has_col($db, 'listing_ranking_cache', 'ranking_score') ? 'ranking_score' : null);
-        if ($rankScoreCol) {
-            $selectCols[] = "COALESCE(lrc.{$rankScoreCol}, 0) AS ranking_score";
+    // gender → sex in DB
+    if ($hasLCol('sex')) {
+        $selectCols[] = 'l.`sex` AS gender';
+    } elseif ($hasLCol('gender')) {
+        $selectCols[] = 'l.`gender`';
+    }
+
+    // price / currency
+    if ($hasLCol('price'))    { $selectCols[] = 'l.`price`'; }
+    if ($hasLCol('currency')) { $selectCols[] = 'l.`currency`'; }
+
+    // image_url — from whichever cover column was found
+    if ($coverCol) {
+        $selectCols[] = "l.`{$coverCol}` AS image_url";
+    }
+
+    // timestamps
+    if ($hasLCol('created_at')) { $selectCols[] = 'l.`created_at`'; }
+    if ($hasLCol('updated_at')) { $selectCols[] = 'l.`updated_at`'; }
+
+    // stock_quantity from stock_total (preferred) or stock_available
+    if ($hasLCol('stock_total')) {
+        $selectCols[] = 'l.`stock_total` AS stock_quantity';
+    } elseif ($hasLCol('stock_quantity')) {
+        $selectCols[] = 'l.`stock_quantity`';
+    }
+
+    // ranking_score — prefer listing_ranking_scores.final_score via JOIN,
+    // else listing_ranking_cache.ranking_score via JOIN,
+    // else listings.ranking_score column directly
+    $hasRankingScores = bv_seller_listings_table_exists($db, 'listing_ranking_scores');
+    $joinSQL          = '';
+
+    if ($hasRankingScores) {
+        $rsListingCol = bv_seller_listings_has_col($db, 'listing_ranking_scores', 'listing_id') ? 'listing_id' : null;
+        $rsFinalCol   = bv_seller_listings_has_col($db, 'listing_ranking_scores', 'final_score') ? 'final_score' : null;
+        if ($rsListingCol && $rsFinalCol) {
+            $joinSQL      .= ' LEFT JOIN listing_ranking_scores lrs ON lrs.listing_id = l.id';
+            $selectCols[]  = 'COALESCE(lrs.final_score, 0) AS ranking_score';
+        } elseif ($hasLCol('ranking_score')) {
+            $selectCols[] = 'l.`ranking_score`';
         } else {
             $selectCols[] = '0 AS ranking_score';
         }
+    } elseif ($hasLCol('ranking_score')) {
+        $selectCols[] = 'l.`ranking_score`';
     } else {
         $selectCols[] = '0 AS ranking_score';
     }
 
-    // Review aggregation subquery
-    if ($hasReviews) {
-        $rvApprWhere = $rvStatusCol ? "AND rv.{$rvStatusCol} = 'approved'" : '';
-        $selectCols[] = "(SELECT COALESCE(AVG(rv.{$rvRatingCol}), 0) FROM listing_reviews rv
-                          WHERE rv.{$rvListingIdCol} = l.id {$rvApprWhere}) AS review_avg";
-        $selectCols[] = "(SELECT COUNT(*) FROM listing_reviews rv
-                          WHERE rv.{$rvListingIdCol} = l.id {$rvApprWhere}) AS review_count";
+    // avg_rating and sold_count from listing_ranking_cache via JOIN
+    if ($hasRankCache && $rcListingCol) {
+        $joinSQL .= " LEFT JOIN listing_ranking_cache lrc ON lrc.{$rcListingCol} = l.id";
+        $selectCols[] = $rcAvgCol  ? 'COALESCE(lrc.avg_rating, 0) AS avg_rating'   : '0 AS avg_rating';
+        $selectCols[] = $rcSoldCol ? 'COALESCE(lrc.sold_count, 0) AS sold_count'    : '0 AS sold_count';
     } else {
-        $selectCols[] = '0 AS review_avg';
-        $selectCols[] = '0 AS review_count';
+        $selectCols[] = '0 AS avg_rating';
+        $selectCols[] = '0 AS sold_count';
     }
 
-    // ── JOINs ─────────────────────────────────────────────────────────────────
-    $joins = '';
-    if ($hasRanking) {
-        $joins .= ' LEFT JOIN listing_ranking_scores lrs ON lrs.listing_id = l.id';
-    } elseif ($hasRankCache && isset($rankScoreCol) && $rankScoreCol !== null) {
-        $joins .= ' LEFT JOIN listing_ranking_cache lrc ON lrc.listing_id = l.id';
-    }
-
-    // ── ORDER BY ──────────────────────────────────────────────────────────────
-    $orderSQL = match ($qSort) {
-        'oldest'     => $hasLCol('created_at') ? 'ORDER BY l.created_at ASC, l.id ASC'   : 'ORDER BY l.id ASC',
-        'price_low'  => $hasLCol('price')      ? 'ORDER BY l.price ASC, l.id DESC'        : 'ORDER BY l.id DESC',
-        'price_high' => $hasLCol('price')      ? 'ORDER BY l.price DESC, l.id DESC'       : 'ORDER BY l.id DESC',
-        'status'     => $hasLCol('status')     ? 'ORDER BY l.status ASC, l.id DESC'       : 'ORDER BY l.id DESC',
-        default      => $hasLCol('created_at') ? 'ORDER BY l.created_at DESC, l.id DESC'  : 'ORDER BY l.id DESC',
-    };
-
-    $fromClause   = "FROM listings l{$joins}";
+    $fromClause   = "FROM listings l{$joinSQL}";
     $selectClause = 'SELECT ' . implode(', ', $selectCols);
+    $orderSQL     = $hasLCol('created_at') ? 'ORDER BY l.created_at DESC, l.id DESC' : 'ORDER BY l.id DESC';
 
     // ── Count query ───────────────────────────────────────────────────────────
     $totalCount = (int) bv_sl_query_scalar(
@@ -720,65 +716,64 @@ try {
     );
 
     // ── Data query ────────────────────────────────────────────────────────────
-    $dataParams = array_merge($whereParams, [$limit, $offset]);
-    $rows = bv_sl_query_rows(
+    $dataParams = array_merge($whereParams, [$perPage, $offset]);
+    $rows       = bv_sl_query_rows(
         $db,
         "{$selectClause} {$fromClause} {$whereSQL} {$orderSQL} LIMIT ? OFFSET ?",
         $dataParams
     );
 
-    // ── Format items ──────────────────────────────────────────────────────────
-    $items = [];
+    // ── Format listings ───────────────────────────────────────────────────────
+    $listings = [];
     foreach ($rows as $row) {
-        $currency  = bv_seller_listings_clean_string($row['currency'] ?? 'USD') ?: 'USD';
-        $coverUrl  = bv_seller_listings_asset_url(
-            bv_seller_listings_clean_string($row['cover_image'] ?? '')
-        );
-        $reviewAvg = round(bv_seller_listings_float($row['review_avg']    ?? 0), 2);
-        $revCount  = bv_seller_listings_int($row['review_count']          ?? 0);
-        $rankScore = round(bv_seller_listings_float($row['ranking_score'] ?? 0), 4);
+        $currency     = bv_seller_listings_clean_string($row['currency'] ?? 'USD') ?: 'USD';
+        $rawImagePath = bv_seller_listings_clean_string($row['image_url'] ?? '');
+        $imageUrl     = bv_seller_listings_asset_url($rawImagePath);
 
-        $items[] = [
-            'id'          => bv_seller_listings_int($row['id']),
-            'title'       => bv_seller_listings_clean_string($row['title']       ?? ''),
-            'slug'        => bv_seller_listings_clean_string($row['slug']        ?? ''),
-            'url'         => bv_seller_listings_listing_url($row),
-            'cover_image' => $coverUrl,
-            'price'       => bv_seller_listings_money($row['price'] ?? 0, $currency),
-            'status'      => bv_seller_listings_clean_string($row['status']      ?? ''),
-            'sale_status' => bv_seller_listings_clean_string($row['sale_status'] ?? ''),
-            'sale_format' => bv_seller_listings_clean_string($row['sale_format'] ?? ''),
-            'species'     => bv_seller_listings_clean_string($row['species']     ?? ''),
-            'strain'      => bv_seller_listings_clean_string($row['strain']      ?? ''),
-            'grade'       => bv_seller_listings_clean_string($row['grade']       ?? ''),
-            'sex'         => bv_seller_listings_clean_string($row['sex']         ?? ''),
-            'color'       => bv_seller_listings_clean_string($row['color']       ?? ''),
-            'tail_type'   => bv_seller_listings_clean_string($row['tail_type']   ?? ''),
-            'stock'       => [
-                'total'     => bv_seller_listings_int($row['stock_total']     ?? 1),
-                'sold'      => bv_seller_listings_int($row['stock_sold']      ?? 0),
-                'available' => bv_seller_listings_int($row['stock_available'] ?? 1),
-            ],
-            'rating'         => ['average' => $reviewAvg, 'count' => $revCount],
-            'ranking_score'  => $rankScore,
-            'created_at'     => bv_seller_listings_clean_string($row['created_at'] ?? ''),
-            'updated_at'     => bv_seller_listings_clean_string($row['updated_at'] ?? ''),
+        $listingItem = [
+            'id'             => bv_seller_listings_int($row['id']),
+            'title'          => bv_seller_listings_clean_string($row['title']       ?? ''),
+            'slug'           => bv_seller_listings_clean_string($row['slug']        ?? ''),
+            'status'         => bv_seller_listings_clean_string($row['status']      ?? ''),
+            'sale_status'    => bv_seller_listings_clean_string($row['sale_status'] ?? ''),
+            'species'        => bv_seller_listings_clean_string($row['species']     ?? ''),
+            'strain'         => bv_seller_listings_clean_string($row['strain']      ?? ''),
+            'gender'         => bv_seller_listings_clean_string($row['gender']      ?? ''),
+            'price'          => bv_seller_listings_float($row['price'] ?? 0),
+            'currency'       => $currency,
+            'image_url'      => $imageUrl,
+            'created_at'     => bv_seller_listings_clean_string($row['created_at']  ?? ''),
+            'updated_at'     => bv_seller_listings_clean_string($row['updated_at']  ?? ''),
+            'views'          => 0,   // column does not exist in schema
+            'favorites'      => 0,   // column does not exist in schema
+            'stock_quantity' => bv_seller_listings_int($row['stock_quantity'] ?? 1),
         ];
+
+        // Optional ranking / review fields — include when available
+        $rankingScore = bv_seller_listings_float($row['ranking_score'] ?? 0);
+        $avgRating    = round(bv_seller_listings_float($row['avg_rating'] ?? 0), 2);
+        $soldCount    = bv_seller_listings_int($row['sold_count'] ?? 0);
+
+        $listingItem['ranking_score'] = round($rankingScore, 4);
+        $listingItem['avg_rating']    = $avgRating;
+        $listingItem['sold_count']    = $soldCount;
+
+        $listings[] = $listingItem;
     }
 
-    // ── Stats (unfiltered by search/status — full picture for this seller) ────
-    $statsData = [
-        'total'     => 0,
-        'draft'     => 0,
-        'pending'   => 0,
-        'active'    => 0,
-        'hidden'    => 0,
-        'sold'      => 0,
-        'available' => 0,
-        'reserved'  => 0,
+    // ── Summary (seller-only counts, unaffected by current filters) ────────────
+    // DB status enum: draft, pending, active, sold, hidden
+    // Spec summary keys: total, active, draft, sold, inactive
+    //   inactive = count of rows with status='hidden'
+    $summary = [
+        'total'    => 0,
+        'active'   => 0,
+        'draft'    => 0,
+        'sold'     => 0,
+        'inactive' => 0,   // = hidden in DB
     ];
 
-    $statsData['total'] = (int) bv_sl_query_scalar(
+    $summary['total'] = (int) bv_sl_query_scalar(
         $db,
         "SELECT COUNT(*) FROM listings WHERE `{$ownerCol}` = ?",
         [$filterUserId],
@@ -792,41 +787,15 @@ try {
             [$filterUserId]
         );
         foreach ($statusRows as $sr) {
-            $s = (string) ($sr['status'] ?? '');
-            if (array_key_exists($s, $statsData)) {
-                $statsData[$s] = (int) ($sr['cnt'] ?? 0);
+            $dbStatus = (string) ($sr['status'] ?? '');
+            $cnt      = (int) ($sr['cnt'] ?? 0);
+            switch ($dbStatus) {
+                case 'active':  $summary['active']   += $cnt; break;
+                case 'draft':   $summary['draft']    += $cnt; break;
+                case 'sold':    $summary['sold']      += $cnt; break;
+                case 'hidden':  $summary['inactive'] += $cnt; break;
+                // 'pending' and other values are not in spec summary, skip
             }
-        }
-    }
-
-    if ($hasLCol('sale_status')) {
-        $saleRows = bv_sl_query_rows(
-            $db,
-            "SELECT sale_status, COUNT(*) AS cnt FROM listings WHERE `{$ownerCol}` = ? GROUP BY sale_status",
-            [$filterUserId]
-        );
-        foreach ($saleRows as $sr) {
-            $ss = (string) ($sr['sale_status'] ?? '');
-            if (array_key_exists($ss, $statsData)) {
-                $statsData[$ss] = (int) ($sr['cnt'] ?? 0);
-            }
-        }
-    }
-
-    // ── Seller identity block ─────────────────────────────────────────────────
-    $sellerName = trim($firstName . ' ' . $lastName);
-    if ($sellerName === '' && $filterUserId !== $userId) {
-        // Admin viewing another seller — try to fetch their name
-        $sellerNameRow = bv_sl_query_row(
-            $db,
-            'SELECT first_name, last_name FROM users WHERE id = ? LIMIT 1',
-            [$filterUserId]
-        );
-        if ($sellerNameRow) {
-            $sellerName = trim(
-                bv_seller_listings_clean_string($sellerNameRow['first_name'] ?? '') . ' ' .
-                bv_seller_listings_clean_string($sellerNameRow['last_name']  ?? '')
-            );
         }
     }
 
@@ -836,21 +805,23 @@ try {
         'data' => [
             'seller'     => [
                 'id'   => $filterUserId,
-                'name' => $sellerName ?: "Seller #{$filterUserId}",
                 'role' => $userRole,
             ],
-            'items'      => $items,
-            'stats'      => $statsData,
+            'filters'    => [
+                'status' => $qStatus,
+            ],
+            'summary'    => $summary,
+            'listings'   => $listings,
             'pagination' => [
                 'page'     => $page,
-                'per_page' => $limit,
+                'per_page' => $perPage,
                 'total'    => $totalCount,
-                'has_more' => ($page * $limit) < $totalCount,
+                'has_more' => ($page * $perPage) < $totalCount,
             ],
         ],
         'meta' => [
-            'api_version'  => 'v1',
-            'generated_at' => gmdate('Y-m-d H:i:s'),
+            'api_version'  => 'mobile-v1',
+            'generated_at' => gmdate('Y-m-d\TH:i:s\Z'),
         ],
     ]);
 
