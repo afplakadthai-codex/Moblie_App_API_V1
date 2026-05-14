@@ -1,54 +1,34 @@
 <?php
 declare(strict_types=1);
 
-// =============================================================================
-// Bettavaro Mobile API v1 — /api/mobile/v1/seller_dashboard.php
-// Authenticated seller dashboard summary endpoint.
-//
-// CRITICAL: Never touches $_SESSION. Never outputs HTML. Never redirects.
-// Does NOT interfere with the website session-based login in login.php.
-//
-// CORS: Not opened broadly. Configure Access-Control-Allow-Origin later
-//       when mobile app domain or API gateway is finalized.
-// =============================================================================
-
 while (ob_get_level() > 0) {
     @ob_end_clean();
 }
 
 header('Content-Type: application/json; charset=UTF-8');
-header('X-Content-Type-Options: nosniff');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('X-Content-Type-Options: nosniff');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Access-Control-Allow-Methods: GET, OPTIONS');
 
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    http_response_code(405);
-    echo json_encode([
-        'ok'    => false,
-        'error' => ['code' => 'method_not_allowed', 'message' => 'Only GET requests are accepted.'],
-    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
+    http_response_code(204);
     exit;
 }
 
-// =============================================================================
-// Root path helpers
-// File lives at: /public_html/api/mobile/v1/seller_dashboard.php
-// dirname(__DIR__, 3) → /public_html
-// dirname(__DIR__, 4) → account root (parent of public_html)
-// =============================================================================
-
-if (!function_exists('bv_seller_dashboard_public_root')) {
-    function bv_seller_dashboard_public_root(): string { return dirname(__DIR__, 3); }
-}
-if (!function_exists('bv_seller_dashboard_project_root')) {
-    function bv_seller_dashboard_project_root(): string { return dirname(bv_seller_dashboard_public_root()); }
+if (!function_exists('bv_sd_meta')) {
+    function bv_sd_meta(): array
+    {
+        return [
+            'api_version' => 'mobile-v1',
+            'generated_at' => gmdate('c'),
+        ];
+    }
 }
 
-// =============================================================================
-// Helpers
-// =============================================================================
-
-if (!function_exists('bv_seller_dashboard_json')) {
-    function bv_seller_dashboard_json(int $statusCode, array $payload): void
+if (!function_exists('bv_sd_json')) {
+    function bv_sd_json(int $statusCode, array $payload): void
     {
         http_response_code($statusCode);
         echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
@@ -56,866 +36,918 @@ if (!function_exists('bv_seller_dashboard_json')) {
     }
 }
 
-if (!function_exists('bv_seller_dashboard_error')) {
-    function bv_seller_dashboard_error(string $code, string $message, int $statusCode = 400): void
+if (!function_exists('bv_sd_error')) {
+    function bv_sd_error(string $code, string $message, int $statusCode): void
     {
-        bv_seller_dashboard_json($statusCode, [
-            'ok'    => false,
-            'error' => ['code' => $code, 'message' => $message],
+        bv_sd_json($statusCode, [
+            'ok' => false,
+            'error' => [
+                'code' => $code,
+                'message' => $message,
+            ],
+            'meta' => bv_sd_meta(),
         ]);
     }
 }
 
-if (!function_exists('bv_seller_dashboard_log')) {
-    function bv_seller_dashboard_log(string $message): void
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
+    bv_sd_error('method_not_allowed', 'Only GET requests are accepted.', 405);
+}
+
+if (!function_exists('bv_sd_public_root')) {
+    function bv_sd_public_root(): string
     {
-        error_log('[BV Seller Dashboard] ' . $message);
-        $line = date('[Y-m-d H:i:s] ') . $message . PHP_EOL;
+        return dirname(__DIR__, 3);
+    }
+}
+
+if (!function_exists('bv_sd_project_root')) {
+    function bv_sd_project_root(): string
+    {
+        return dirname(bv_sd_public_root());
+    }
+}
+
+if (!function_exists('bv_sd_log')) {
+    function bv_sd_log(string $message): void
+    {
+        error_log('[Bettavaro Mobile Seller Dashboard] ' . $message);
+        $line = gmdate('[Y-m-d H:i:s] ') . $message . PHP_EOL;
         foreach ([
-            bv_seller_dashboard_project_root() . '/private_html/mobile_api.log',
-            bv_seller_dashboard_public_root()  . '/logs/mobile_api.log',
-        ] as $lf) {
-            $ld = dirname($lf);
-            if (is_dir($ld) && is_writable($ld)) { @file_put_contents($lf, $line, FILE_APPEND | LOCK_EX); break; }
+            bv_sd_public_root() . '/logs/mobile_api.log',
+            bv_sd_project_root() . '/logs/mobile_api.log',
+            bv_sd_project_root() . '/private_html/mobile_api.log',
+        ] as $path) {
+            $dir = dirname($path);
+            if (is_dir($dir) && is_writable($dir)) {
+                @file_put_contents($path, $line, FILE_APPEND | LOCK_EX);
+                break;
+            }
         }
     }
 }
 
-if (!function_exists('bv_seller_dashboard_db')) {
-    function bv_seller_dashboard_db(): ?object
+if (!function_exists('bv_sd_db')) {
+    function bv_sd_db(): ?object
     {
-        static $cached = false;
+        static $loaded = false;
         static $connection = null;
-        if ($cached !== false) { return $connection; }
-        $cached     = true;
-        $publicRoot = bv_seller_dashboard_public_root();
-        foreach ([
+
+        if ($loaded) {
+            return $connection;
+        }
+
+        $loaded = true;
+        $publicRoot = bv_sd_public_root();
+        $projectRoot = bv_sd_project_root();
+        $candidates = [
             $publicRoot . '/config/db.php',
             $publicRoot . '/includes/db.php',
             $publicRoot . '/includes/config.php',
-        ] as $cfg) {
-            if (!is_file($cfg)) { continue; }
-            $loader = static function (string $path): array {
-                $db_host=$db_user=$db_pass=$db_name=$db_port=null;
-                $host=$user=$pass=$name=$port=null;
-                $DB_HOST=$DB_USER=$DB_PASS=$DB_NAME=$DB_PORT=null;
-                $dsn=null; $pdo=$conn=$db=$mysqli=$link=null;
-                /** @noinspection PhpIncludeInspection */ @include $path;
-                return compact('db_host','db_user','db_pass','db_name','db_port',
-                    'host','user','pass','name','port',
-                    'DB_HOST','DB_USER','DB_PASS','DB_NAME','DB_PORT',
-                    'dsn','pdo','conn','db','mysqli','link');
+            $projectRoot . '/config/db.php',
+            $projectRoot . '/includes/db.php',
+            $projectRoot . '/includes/config.php',
+            $projectRoot . '/db.php',
+            $projectRoot . '/config.php',
+        ];
+
+        foreach ($candidates as $path) {
+            if (!is_file($path)) {
+                continue;
+            }
+
+            $loader = static function (string $file): array {
+                $db_host = $db_user = $db_pass = $db_name = $db_port = null;
+                $host = $user = $pass = $name = $port = null;
+                $DB_HOST = $DB_USER = $DB_PASS = $DB_NAME = $DB_PORT = null;
+                $dsn = null;
+                $pdo = $conn = $db = $mysqli = $link = null;
+                /** @noinspection PhpIncludeInspection */
+                include $file;
+
+                return compact(
+                    'db_host', 'db_user', 'db_pass', 'db_name', 'db_port',
+                    'host', 'user', 'pass', 'name', 'port',
+                    'DB_HOST', 'DB_USER', 'DB_PASS', 'DB_NAME', 'DB_PORT',
+                    'dsn', 'pdo', 'conn', 'db', 'mysqli', 'link'
+                );
             };
-            $vars = $loader($cfg);
-            foreach (['pdo','conn','db','mysqli','link'] as $n) {
-                if (isset($vars[$n]) && ($vars[$n] instanceof PDO || $vars[$n] instanceof mysqli)) {
-                    $connection = $vars[$n]; return $connection;
+
+            try {
+                $vars = $loader($path);
+            } catch (Throwable $e) {
+                bv_sd_log('Config include failed: ' . $e->getMessage());
+                continue;
+            }
+
+            foreach (['pdo', 'conn', 'db', 'mysqli', 'link'] as $name) {
+                if (isset($vars[$name]) && ($vars[$name] instanceof PDO || $vars[$name] instanceof mysqli)) {
+                    $connection = $vars[$name];
+                    return $connection;
+                }
+                if (isset($GLOBALS[$name]) && ($GLOBALS[$name] instanceof PDO || $GLOBALS[$name] instanceof mysqli)) {
+                    $connection = $GLOBALS[$name];
+                    return $connection;
                 }
             }
-            foreach (['pdo','conn','db','mysqli','link'] as $gn) {
-                if (isset($GLOBALS[$gn])) {
-                    $obj = $GLOBALS[$gn];
-                    if ($obj instanceof PDO || $obj instanceof mysqli) { $connection=$obj; return $connection; }
+
+            $dbHost = $vars['db_host'] ?? $vars['host'] ?? $vars['DB_HOST'] ?? null;
+            $dbUser = $vars['db_user'] ?? $vars['user'] ?? $vars['DB_USER'] ?? null;
+            $dbPass = $vars['db_pass'] ?? $vars['pass'] ?? $vars['DB_PASS'] ?? '';
+            $dbName = $vars['db_name'] ?? $vars['name'] ?? $vars['DB_NAME'] ?? null;
+            $dbPort = (int) ($vars['db_port'] ?? $vars['port'] ?? $vars['DB_PORT'] ?? 3306);
+
+            if ($dbHost && $dbUser !== null && $dbName) {
+                if (class_exists('PDO')) {
+                    try {
+                        $pdo = new PDO(
+                            'mysql:host=' . $dbHost . ';port=' . $dbPort . ';dbname=' . $dbName . ';charset=utf8mb4',
+                            (string) $dbUser,
+                            (string) $dbPass,
+                            [
+                                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                                PDO::ATTR_EMULATE_PREPARES => false,
+                            ]
+                        );
+                        $connection = $pdo;
+                        return $connection;
+                    } catch (Throwable $e) {
+                        bv_sd_log('PDO connection failed: ' . $e->getMessage());
+                    }
+                }
+
+                if (class_exists('mysqli')) {
+                    try {
+                        $mysqli = @new mysqli((string) $dbHost, (string) $dbUser, (string) $dbPass, (string) $dbName, $dbPort ?: 3306);
+                        if (!$mysqli->connect_errno) {
+                            $mysqli->set_charset('utf8mb4');
+                            $connection = $mysqli;
+                            return $connection;
+                        }
+                        bv_sd_log('mysqli connection failed: ' . $mysqli->connect_error);
+                    } catch (Throwable $e) {
+                        bv_sd_log('mysqli connection exception: ' . $e->getMessage());
+                    }
                 }
             }
-            $h  = $vars['db_host'] ?? $vars['host']    ?? $vars['DB_HOST']  ?? null;
-            $u  = $vars['db_user'] ?? $vars['user']    ?? $vars['DB_USER']  ?? null;
-            $p  = $vars['db_pass'] ?? $vars['pass']    ?? $vars['DB_PASS']  ?? null;
-            $n  = $vars['db_name'] ?? $vars['name']    ?? $vars['DB_NAME']  ?? null;
-            $pt = (int)($vars['db_port'] ?? $vars['port'] ?? $vars['DB_PORT'] ?? 3306);
-            if ($h && $u !== null && $n) {
-                try {
-                    $pdo = new PDO("mysql:host={$h};port={$pt};dbname={$n};charset=utf8mb4", $u, (string)$p, [
-                        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-                        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                        PDO::ATTR_EMULATE_PREPARES   => false,
-                    ]);
-                    $connection=$pdo; return $connection;
-                } catch (\Throwable $e) { error_log('[BV Seller Dashboard] PDO: '.$e->getMessage()); }
-            }
-            if ($h && $u !== null && $n && function_exists('mysqli_connect')) {
-                try {
-                    $m = @new mysqli($h,(string)$u,(string)$p,$n,$pt?:3306);
-                    if (!$m->connect_errno) { $m->set_charset('utf8mb4'); $connection=$m; return $connection; }
-                    error_log('[BV Seller Dashboard] mysqli: '.$m->connect_error);
-                } catch (\Throwable $e) { error_log('[BV Seller Dashboard] mysqli ex: '.$e->getMessage()); }
-            }
-            break;
         }
+
         return null;
     }
 }
 
-if (!function_exists('bv_seller_dashboard_table_exists')) {
-    function bv_seller_dashboard_table_exists(object $db, string $table): bool
+if (!function_exists('bv_sd_ident')) {
+    function bv_sd_ident(string $identifier): string
     {
-        if (!preg_match('/^[a-zA-Z0-9_]+$/', $table)) { return false; }
-        try {
-            if ($db instanceof PDO) {
-                $prev = $db->getAttribute(PDO::ATTR_ERRMODE);
-                $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-                try { $db->query("SELECT 1 FROM `{$table}` LIMIT 1"); $db->setAttribute(PDO::ATTR_ERRMODE,$prev); return true; }
-                catch (\PDOException $e) { $db->setAttribute(PDO::ATTR_ERRMODE,$prev); return false; }
-            }
-            if ($db instanceof mysqli) {
-                $res = $db->query("SELECT 1 FROM `{$table}` LIMIT 1");
-                if ($res!==false) { if ($res instanceof mysqli_result){$res->free();} return true; }
-                return false;
-            }
-        } catch (\Throwable $e) { error_log('[BV Seller Dashboard] table_exists: '.$e->getMessage()); }
-        return false;
-    }
-}
-
-if (!function_exists('bv_seller_dashboard_columns')) {
-    function bv_seller_dashboard_columns(object $db, string $table): array
-    {
-        $cols=[];
-        try {
-            if ($db instanceof PDO) {
-                $st=$db->prepare('SHOW COLUMNS FROM `'.str_replace('`','',$table).'`');
-                $st->execute();
-                foreach ($st->fetchAll() as $r) { $cols[]=strtolower((string)($r['Field']??'')); }
-            } elseif ($db instanceof mysqli) {
-                $safe=str_replace('`','',$table);
-                $res=$db->query("SHOW COLUMNS FROM `{$safe}`");
-                if ($res) { while ($r=$res->fetch_assoc()) { $cols[]=strtolower((string)($r['Field']??'')); } }
-            }
-        } catch (\Throwable $e) { error_log('[BV Seller Dashboard] columns: '.$e->getMessage()); }
-        return $cols;
-    }
-}
-
-if (!function_exists('bv_seller_dashboard_has_col')) {
-    function bv_seller_dashboard_has_col(object $db, string $table, string $column): bool
-    {
-        static $cache=[];
-        $key=$table.'.'.$column;
-        if (!array_key_exists($key,$cache)) {
-            $cache[$key]=in_array(strtolower($column),bv_seller_dashboard_columns($db,$table),true);
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $identifier)) {
+            throw new InvalidArgumentException('Invalid database identifier.');
         }
-        return $cache[$key];
+        return '`' . $identifier . '`';
     }
 }
 
-if (!function_exists('bv_sd_clean')) {
-    function bv_sd_clean($v): string
-    { if ($v===null||$v===false) return ''; return htmlspecialchars_decode(strip_tags((string)$v),ENT_QUOTES|ENT_HTML5); }
-}
-if (!function_exists('bv_sd_int')) {
-    function bv_sd_int($v,int $d=0): int { return is_numeric($v)?(int)$v:$d; }
-}
-if (!function_exists('bv_sd_float')) {
-    function bv_sd_float($v,float $d=0.0): float { return is_numeric($v)?(float)$v:$d; }
-}
-if (!function_exists('bv_sd_asset_url')) {
-    function bv_sd_asset_url(?string $p): string
+if (!function_exists('bv_sd_bind_types')) {
+    function bv_sd_bind_types(array $params): string
     {
-        if (!$p||trim($p)==='') return '';
-        $p=trim($p);
-        if (str_starts_with($p,'http://')||str_starts_with($p,'https://')) return $p;
-        return rtrim(defined('BV_SITE_URL')?BV_SITE_URL:'https://www.bettavaro.com','/').'/'.ltrim($p,'/');
-    }
-}
-if (!function_exists('bv_sd_listing_url')) {
-    function bv_sd_listing_url(?int $id,?string $slug): string
-    {
-        $base=rtrim(defined('BV_SITE_URL')?BV_SITE_URL:'https://www.bettavaro.com','/');
-        if ($slug&&$slug!=='') return $base.'/listing.php?slug='.urlencode($slug);
-        if ($id&&$id>0) return $base.'/listing.php?id='.$id;
-        return $base.'/listing.php';
-    }
-}
-if (!function_exists('bv_sd_read_bearer')) {
-    function bv_sd_read_bearer(): string
-    {
-        $h='';
-        if (!empty($_SERVER['HTTP_AUTHORIZATION'])) { $h=(string)$_SERVER['HTTP_AUTHORIZATION']; }
-        elseif (!empty($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) { $h=(string)$_SERVER['REDIRECT_HTTP_AUTHORIZATION']; }
-        elseif (function_exists('apache_request_headers')) {
-            foreach (apache_request_headers() as $k=>$v) {
-                if (strtolower($k)==='authorization') { $h=(string)$v; break; }
+        $types = '';
+        foreach ($params as $value) {
+            if (is_int($value)) {
+                $types .= 'i';
+            } elseif (is_float($value)) {
+                $types .= 'd';
+            } else {
+                $types .= 's';
             }
         }
-        if ($h===''||!preg_match('/^Bearer\s+(\S+)$/i',trim($h),$m)) return '';
-        return $m[1];
+        return $types;
     }
 }
 
-// ── Query helpers ─────────────────────────────────────────────────────────────
-if (!function_exists('bv_sd_row')) {
-    function bv_sd_row(object $db,string $sql,array $p=[]): ?array
+if (!function_exists('bv_sd_fetch_all')) {
+    function bv_sd_fetch_all(object $db, string $sql, array $params = []): array
     {
-        try {
-            if ($db instanceof PDO) { $st=$db->prepare($sql);$st->execute($p);$r=$st->fetch();return $r?:null; }
-            if ($db instanceof mysqli) {
-                $st=$db->prepare($sql); if($st===false)return null;
-                if (!empty($p)) { $t=implode('',array_map(static fn($v)=>is_int($v)?'i':(is_float($v)?'d':'s'),$p));$ref=[&$t];foreach($p as $k=>$_){$ref[]=&$p[$k];}call_user_func_array([$st,'bind_param'],$ref); }
-                $st->execute();$res=$st->get_result();$r=$res?$res->fetch_assoc():null;$st->close();return $r?:null;
+        if ($db instanceof PDO) {
+            $statement = $db->prepare($sql);
+            $statement->execute($params);
+            return $statement->fetchAll(PDO::FETCH_ASSOC) ?: [];
+        }
+
+        if ($db instanceof mysqli) {
+            $statement = $db->prepare($sql);
+            if (!$statement) {
+                throw new RuntimeException('Unable to prepare statement.');
             }
-        } catch (\Throwable $e) { error_log('[BV Seller Dashboard] row: '.$e->getMessage()); }
-        return null;
+
+            if ($params) {
+                $values = array_values($params);
+                $types = bv_sd_bind_types($values);
+                $statement->bind_param($types, ...$values);
+            }
+
+            if (!$statement->execute()) {
+                $statement->close();
+                throw new RuntimeException('Unable to execute statement.');
+            }
+
+            $result = $statement->get_result();
+            $rows = $result ? ($result->fetch_all(MYSQLI_ASSOC) ?: []) : [];
+            if ($result instanceof mysqli_result) {
+                $result->free();
+            }
+            $statement->close();
+            return $rows;
+        }
+
+        throw new RuntimeException('Unsupported database connection.');
     }
 }
-if (!function_exists('bv_sd_rows')) {
-    function bv_sd_rows(object $db,string $sql,array $p=[]): array
+
+if (!function_exists('bv_sd_fetch_one')) {
+    function bv_sd_fetch_one(object $db, string $sql, array $params = []): ?array
     {
-        try {
-            if ($db instanceof PDO) { $st=$db->prepare($sql);$st->execute($p);return $st->fetchAll()?:[]; }
-            if ($db instanceof mysqli) {
-                $st=$db->prepare($sql); if($st===false)return [];
-                if (!empty($p)) { $t=implode('',array_map(static fn($v)=>is_int($v)?'i':(is_float($v)?'d':'s'),$p));$ref=[&$t];foreach($p as $k=>$_){$ref[]=&$p[$k];}call_user_func_array([$st,'bind_param'],$ref); }
-                $st->execute();$res=$st->get_result();$rows=[];if($res){while($r=$res->fetch_assoc()){$rows[]=$r;}}$st->close();return $rows;
-            }
-        } catch (\Throwable $e) { error_log('[BV Seller Dashboard] rows: '.$e->getMessage()); }
-        return [];
+        $rows = bv_sd_fetch_all($db, $sql, $params);
+        return $rows[0] ?? null;
     }
 }
+
 if (!function_exists('bv_sd_scalar')) {
-    function bv_sd_scalar(object $db,string $sql,array $p=[],$d=0)
+    function bv_sd_scalar(object $db, string $sql, array $params = [], $default = 0)
     {
-        try {
-            if ($db instanceof PDO) { $st=$db->prepare($sql);$st->execute($p);$r=$st->fetch(PDO::FETCH_NUM);return $r?$r[0]:$d; }
-            if ($db instanceof mysqli) {
-                $st=$db->prepare($sql); if($st===false)return $d;
-                if (!empty($p)) { $t=implode('',array_map(static fn($v)=>is_int($v)?'i':(is_float($v)?'d':'s'),$p));$ref=[&$t];foreach($p as $k=>$_){$ref[]=&$p[$k];}call_user_func_array([$st,'bind_param'],$ref); }
-                $st->execute();$res=$st->get_result();$r=$res?$res->fetch_row():null;$st->close();return $r?$r[0]:$d;
-            }
-        } catch (\Throwable $e) { error_log('[BV Seller Dashboard] scalar: '.$e->getMessage()); }
-        return $d;
-    }
-}
-if (!function_exists('bv_sd_exec')) {
-    function bv_sd_exec(object $db,string $sql,array $p=[]): bool
-    {
-        try {
-            if ($db instanceof PDO) { return $db->prepare($sql)->execute($p); }
-            if ($db instanceof mysqli) {
-                $st=$db->prepare($sql); if($st===false)return false;
-                if (!empty($p)) { $t=implode('',array_map(static fn($v)=>is_int($v)?'i':(is_float($v)?'d':'s'),$p));$ref=[&$t];foreach($p as $k=>$_){$ref[]=&$p[$k];}call_user_func_array([$st,'bind_param'],$ref); }
-                $result=$st->execute();$st->close();return $result;
-            }
-        } catch (\Throwable $e) { error_log('[BV Seller Dashboard] exec: '.$e->getMessage()); }
-        return false;
+        $row = bv_sd_fetch_one($db, $sql, $params);
+        if (!$row) {
+            return $default;
+        }
+        $values = array_values($row);
+        return $values[0] ?? $default;
     }
 }
 
-// =============================================================================
-// Main execution
-// =============================================================================
-try {
-
-    // ── Auth ──────────────────────────────────────────────────────────────────
-    $plainToken = bv_sd_read_bearer();
-    if ($plainToken==='') { bv_seller_dashboard_error('token_missing','Authorization token is required.',401); }
-    $tokenHash = hash('sha256',$plainToken);
-
-    $db = bv_seller_dashboard_db();
-    if ($db===null) { bv_seller_dashboard_log('No DB connection.'); bv_seller_dashboard_error('db_unavailable','Service temporarily unavailable.',503); }
-
-    $tokenRow = bv_sd_row($db,
-        "SELECT mat.id AS token_id,u.id AS user_id,u.email,u.role,u.account_status,u.first_name,u.last_name
-         FROM mobile_auth_tokens mat INNER JOIN users u ON u.id=mat.user_id
-         WHERE mat.token_hash=? AND mat.revoked_at IS NULL AND mat.expires_at>NOW() AND u.account_status='active' LIMIT 1",
-        [$tokenHash]
-    );
-    if ($tokenRow===null) { bv_seller_dashboard_error('token_invalid','Token is invalid or has expired.',401); }
-
-    bv_sd_exec($db,'UPDATE mobile_auth_tokens SET last_used_at=NOW() WHERE id=? LIMIT 1',[(int)$tokenRow['token_id']]);
-
-    $userId    = (int)$tokenRow['user_id'];
-    $userRole  = bv_sd_clean($tokenRow['role']       ?? 'user');
-    $firstName = bv_sd_clean($tokenRow['first_name'] ?? '');
-    $lastName  = bv_sd_clean($tokenRow['last_name']  ?? '');
-    $userEmail = bv_sd_clean($tokenRow['email']      ?? '');
-
-    if (!in_array($userRole,['seller','admin'],true)) { bv_seller_dashboard_error('seller_required','Seller access is required.',403); }
-
-    // Admin override
-    $filterSellerId = $userId;
-    if ($userRole==='admin') {
-        $rawAdmin = bv_sd_int($_GET['seller_id'] ?? 0,0);
-        if ($rawAdmin>0) { $filterSellerId=$rawAdmin; }
-    }
-
-    // Period
-    $days   = min(365,max(1,bv_sd_int($_GET['days'] ?? 30,30)));
-    $dateTo = date('Y-m-d H:i:s');
-    $dateFrom = date('Y-m-d H:i:s',strtotime("-{$days} days"));
-
-    $siteBase = rtrim(defined('BV_SITE_URL')?BV_SITE_URL:'https://www.bettavaro.com','/');
-
-    // ── Required tables check ─────────────────────────────────────────────────
-    if (!bv_seller_dashboard_table_exists($db,'listings')) { bv_seller_dashboard_error('db_unavailable','Service temporarily unavailable.',503); }
-
-    // ── Detect optional tables ────────────────────────────────────────────────
-    $hasOrders      = bv_seller_dashboard_table_exists($db,'orders');
-    $hasOI          = $hasOrders && bv_seller_dashboard_table_exists($db,'order_items');
-    $hasReviews     = bv_seller_dashboard_table_exists($db,'listing_reviews');
-    $hasRanking     = bv_seller_dashboard_table_exists($db,'listing_ranking_scores');
-    $hasRankCache   = !$hasRanking && bv_seller_dashboard_table_exists($db,'listing_ranking_cache');
-    $hasRefunds     = $hasOI && bv_seller_dashboard_table_exists($db,'order_refunds');
-    $hasRefItems    = $hasRefunds && bv_seller_dashboard_table_exists($db,'order_refund_items');
-    $hasBalance     = bv_seller_dashboard_table_exists($db,'seller_balance_entries');
-    $hasSellerApps  = bv_seller_dashboard_table_exists($db,'seller_applications');
-
-    // ── Listing ownership column ──────────────────────────────────────────────
-    $lCols = bv_seller_dashboard_columns($db,'listings');
-    $hasLCol = static fn(string $c): bool => in_array(strtolower($c),$lCols,true);
-    $lOwnerCol = null;
-    foreach (['seller_id','seller_user_id','user_id','owner_user_id'] as $cand) {
-        if ($hasLCol($cand)) { $lOwnerCol=$cand; break; }
-    }
-
-    // ── Order item ownership ──────────────────────────────────────────────────
-    $oiSellerCol    = null;
-    $listingOwnerCol = null;
-    if ($hasOI) {
-        $oiCols = bv_seller_dashboard_columns($db,'order_items');
-        foreach (['seller_id','seller_user_id'] as $cand) {
-            if (in_array($cand,$oiCols,true)) { $oiSellerCol=$cand; break; }
+if (!function_exists('bv_sd_execute')) {
+    function bv_sd_execute(object $db, string $sql, array $params = []): void
+    {
+        if ($db instanceof PDO) {
+            $statement = $db->prepare($sql);
+            $statement->execute($params);
+            return;
         }
-        if ($oiSellerCol===null) {
-            foreach (['seller_id','seller_user_id','user_id','owner_user_id'] as $cand) {
-                if ($hasLCol($cand)) { $listingOwnerCol=$cand; break; }
+
+        if ($db instanceof mysqli) {
+            $statement = $db->prepare($sql);
+            if (!$statement) {
+                throw new RuntimeException('Unable to prepare statement.');
             }
-        }
-    }
-
-    // Ownership subquery for orders (reused across order-related sections)
-    // NEVER uses orders.user_id
-    $orderOwnerSubquery = '';
-    $orderOwnerParams   = [];
-    if ($hasOI) {
-        if ($oiSellerCol!==null) {
-            $orderOwnerSubquery = "SELECT DISTINCT order_id FROM order_items WHERE `{$oiSellerCol}`=?";
-            $orderOwnerParams   = [$filterSellerId];
-        } elseif ($listingOwnerCol!==null) {
-            $orderOwnerSubquery = "SELECT DISTINCT oi2.order_id FROM order_items oi2 INNER JOIN listings l2 ON l2.id=oi2.listing_id WHERE l2.`{$listingOwnerCol}`=?";
-            $orderOwnerParams   = [$filterSellerId];
-        }
-    }
-
-    // ── Seller profile ────────────────────────────────────────────────────────
-    $farmName          = '';
-    $applicationStatus = '';
-    if ($filterSellerId !== $userId) {
-        $sellerURow = bv_sd_row($db,'SELECT email,first_name,last_name FROM users WHERE id=? LIMIT 1',[$filterSellerId]);
-        if ($sellerURow) {
-            $firstName = bv_sd_clean($sellerURow['first_name']??'');
-            $lastName  = bv_sd_clean($sellerURow['last_name'] ??'');
-            $userEmail = bv_sd_clean($sellerURow['email']     ??'');
-        }
-    }
-    if ($hasSellerApps) {
-        $saRow = bv_sd_row($db,"SELECT farm_name,application_status FROM seller_applications WHERE user_id=? ORDER BY id DESC LIMIT 1",[$filterSellerId]);
-        if ($saRow) {
-            $farmName          = bv_sd_clean($saRow['farm_name']          ??'');
-            $applicationStatus = bv_sd_clean($saRow['application_status'] ??'');
-        }
-    }
-    $sellerName = trim($firstName.' '.$lastName) ?: "Seller #{$filterSellerId}";
-
-    // ── Listing summary ───────────────────────────────────────────────────────
-    $listingSummary = ['total'=>0,'active'=>0,'draft'=>0,'pending'=>0,'hidden'=>0,'sold'=>0,'available'=>0,'reserved'=>0];
-    if ($lOwnerCol!==null) {
-        $listingSummary['total'] = (int)bv_sd_scalar($db,"SELECT COUNT(*) FROM listings WHERE `{$lOwnerCol}`=?",[$filterSellerId]);
-        if ($hasLCol('status')) {
-            $lsRows = bv_sd_rows($db,"SELECT status,COUNT(*) AS cnt FROM listings WHERE `{$lOwnerCol}`=? GROUP BY status",[$filterSellerId]);
-            foreach ($lsRows as $lr) {
-                $s=bv_sd_clean($lr['status']??'');
-                if (in_array($s,['active','published','available'],true)) { $listingSummary['active'] += (int)($lr['cnt']??0); }
-                elseif (isset($listingSummary[$s])) { $listingSummary[$s] += (int)($lr['cnt']??0); }
+            if ($params) {
+                $values = array_values($params);
+                $types = bv_sd_bind_types($values);
+                $statement->bind_param($types, ...$values);
             }
+            if (!$statement->execute()) {
+                $statement->close();
+                throw new RuntimeException('Unable to execute statement.');
+            }
+            $statement->close();
+            return;
         }
-        if ($hasLCol('sale_status')) {
-            $ssRows = bv_sd_rows($db,"SELECT sale_status,COUNT(*) AS cnt FROM listings WHERE `{$lOwnerCol}`=? GROUP BY sale_status",[$filterSellerId]);
-            foreach ($ssRows as $sr) {
-                $s=bv_sd_clean($sr['sale_status']??'');
-                if (in_array($s,['available','reserved'],true) && isset($listingSummary[$s])) {
-                    $listingSummary[$s] = (int)($sr['cnt']??0);
+
+        throw new RuntimeException('Unsupported database connection.');
+    }
+}
+
+if (!function_exists('bv_sd_table_exists')) {
+    function bv_sd_table_exists(object $db, string $table): bool
+    {
+        static $cache = [];
+        $key = strtolower($table);
+        if (array_key_exists($key, $cache)) {
+            return $cache[$key];
+        }
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            $cache[$key] = false;
+            return false;
+        }
+
+        try {
+            $rows = bv_sd_fetch_all($db, 'SHOW TABLES LIKE ?', [$table]);
+            $cache[$key] = !empty($rows);
+            return $cache[$key];
+        } catch (Throwable $e) {
+            bv_sd_log('Table detection failed for ' . $table . ': ' . $e->getMessage());
+            $cache[$key] = false;
+            return false;
+        }
+    }
+}
+
+if (!function_exists('bv_sd_columns')) {
+    function bv_sd_columns(object $db, string $table): ?array
+    {
+        static $cache = [];
+        $key = strtolower($table);
+        if (array_key_exists($key, $cache)) {
+            return $cache[$key];
+        }
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $table) || !bv_sd_table_exists($db, $table)) {
+            $cache[$key] = null;
+            return null;
+        }
+
+        try {
+            $rows = bv_sd_fetch_all($db, 'SHOW COLUMNS FROM ' . bv_sd_ident($table));
+            $columns = [];
+            foreach ($rows as $row) {
+                if (isset($row['Field'])) {
+                    $columns[strtolower((string) $row['Field'])] = (string) $row['Field'];
                 }
-                if ($s==='sold') { $listingSummary['sold'] = max($listingSummary['sold'],(int)($sr['cnt']??0)); }
+            }
+            $cache[$key] = $columns;
+            return $columns;
+        } catch (Throwable $e) {
+            bv_sd_log('Column detection failed for ' . $table . ': ' . $e->getMessage());
+            $cache[$key] = null;
+            return null;
+        }
+    }
+}
+
+if (!function_exists('bv_sd_has_col')) {
+    function bv_sd_has_col(?array $columns, string $column): bool
+    {
+        return $columns !== null && isset($columns[strtolower($column)]);
+    }
+}
+
+if (!function_exists('bv_sd_col')) {
+    function bv_sd_col(?array $columns, string $column): ?string
+    {
+        return $columns[strtolower($column)] ?? null;
+    }
+}
+
+if (!function_exists('bv_sd_first_col')) {
+    function bv_sd_first_col(?array $columns, array $candidates): ?string
+    {
+        foreach ($candidates as $candidate) {
+            $column = bv_sd_col($columns, $candidate);
+            if ($column !== null) {
+                return $column;
             }
         }
+        return null;
     }
+}
 
-    // ── Recent listings ───────────────────────────────────────────────────────
-    $recentListings = [];
-    if ($lOwnerCol!==null) {
-        $rlSelCols = ['l.id'];
-        foreach (['title','slug','price','currency','status','sale_status','created_at'] as $c) {
-            if ($hasLCol($c)) { $rlSelCols[]="l.`{$c}`"; }
+if (!function_exists('bv_sd_header')) {
+    function bv_sd_header(string $name): ?string
+    {
+        $serverName = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
+        if (isset($_SERVER[$serverName]) && trim((string) $_SERVER[$serverName]) !== '') {
+            return trim((string) $_SERVER[$serverName]);
         }
-        $rlCoverCol=null;
-        foreach (['cover_image','image','image_path','main_image','thumbnail'] as $c) {
-            if ($hasLCol($c)) { $rlCoverCol=$c; break; }
-        }
-        if ($rlCoverCol) { $rlSelCols[]="l.`{$rlCoverCol}` AS cover_image"; }
 
-        $rlRankCol=null;
-        $rlRankJoin='';
-        if ($hasRanking) { $rlSelCols[]='COALESCE(lrs.final_score,0) AS ranking_score'; $rlRankJoin=' LEFT JOIN listing_ranking_scores lrs ON lrs.listing_id=l.id'; }
-        elseif ($hasRankCache) {
-            $rcCols=bv_seller_dashboard_columns($db,'listing_ranking_cache');
-            $rlRankCol=in_array('final_score',$rcCols,true)?'final_score':(in_array('ranking_score',$rcCols,true)?'ranking_score':null);
-            if ($rlRankCol) { $rlSelCols[]="COALESCE(lrc.`{$rlRankCol}`,0) AS ranking_score"; $rlRankJoin=' LEFT JOIN listing_ranking_cache lrc ON lrc.listing_id=l.id'; }
-            else { $rlSelCols[]='0 AS ranking_score'; }
-        } else { $rlSelCols[]='0 AS ranking_score'; }
+        if (strtolower($name) === 'authorization') {
+            foreach (['REDIRECT_HTTP_AUTHORIZATION', 'Authorization'] as $key) {
+                if (isset($_SERVER[$key]) && trim((string) $_SERVER[$key]) !== '') {
+                    return trim((string) $_SERVER[$key]);
+                }
+            }
 
-        $rlOrderBy = $hasLCol('created_at') ? 'ORDER BY l.created_at DESC,l.id DESC' : 'ORDER BY l.id DESC';
-        $rlRows = bv_sd_rows($db,
-            'SELECT '.implode(', ',$rlSelCols)." FROM listings l{$rlRankJoin} WHERE l.`{$lOwnerCol}`=? {$rlOrderBy} LIMIT 5",
-            [$filterSellerId]
-        );
-        foreach ($rlRows as $r) {
-            $cur=bv_sd_clean($r['currency']??'USD')?:'USD';
-            $amt=bv_sd_float($r['price']??0);
-            $slug=bv_sd_clean($r['slug']??'');
-            $recentListings[]=[
-                'id'           => bv_sd_int($r['id']),
-                'title'        => bv_sd_clean($r['title']??''),
-                'slug'         => $slug,
-                'url'          => bv_sd_listing_url(bv_sd_int($r['id']),$slug),
-                'cover_image'  => bv_sd_asset_url(bv_sd_clean($r['cover_image']??'')),
-                'price'        => ['amount'=>$amt,'currency'=>$cur,'formatted'=>$cur.' '.number_format($amt,2)],
-                'status'       => bv_sd_clean($r['status']??''),
-                'sale_status'  => bv_sd_clean($r['sale_status']??''),
-                'ranking_score'=> round(bv_sd_float($r['ranking_score']??0),4),
-                'created_at'   => bv_sd_clean($r['created_at']??''),
-            ];
-        }
-    }
-
-    // ── Order summary + sales summary + recent orders ─────────────────────────
-    $orderSummary = ['total_orders'=>0,'pending'=>0,'pending_payment'=>0,'paid'=>0,
-                     'processing'=>0,'shipped'=>0,'completed'=>0,'cancelled'=>0,'refunded'=>0];
-    $salesSummary = ['currency'=>'USD','seller_gross_sales'=>0.0,'seller_paid_sales'=>0.0,
-                     'seller_refunded_amount'=>0.0,'seller_net_sales'=>0.0,'sold_item_count'=>0];
-    $fulfillmentSummary = ['to_ship'=>0,'processing'=>0,'shipped'=>0,'completed'=>0];
-    $recentOrders = [];
-
-    if ($hasOI && $orderOwnerSubquery!=='') {
-        $oCols   = bv_seller_dashboard_columns($db,'orders');
-        $hasOCol = static fn(string $c): bool => in_array(strtolower($c),$oCols,true);
-        $oiCols2 = bv_seller_dashboard_columns($db,'order_items');
-        $hasOiCol2 = static fn(string $c): bool => in_array(strtolower($c),$oiCols2,true);
-
-        // Line total expression for order_items
-        $ltExpr = $oiSellerCol!==null
-            ? "CASE WHEN oi.line_total IS NOT NULL THEN oi.line_total ELSE oi.qty*oi.unit_price END"
-            : "CASE WHEN oi.line_total IS NOT NULL THEN oi.line_total ELSE oi.qty*oi.unit_price END";
-        $oiWhere = $oiSellerCol!==null
-            ? "oi.`{$oiSellerCol}`=?"
-            : "EXISTS(SELECT 1 FROM listings lx WHERE lx.id=oi.listing_id AND lx.`{$listingOwnerCol}`=?)";
-
-        // Date filter on orders if column exists
-        $periodWhere = $hasOCol('created_at') ? "AND o.created_at BETWEEN ? AND ?" : '';
-        $periodParams = $hasOCol('created_at') ? [$dateFrom,$dateTo] : [];
-
-        // Order status summary
-        $orderSummary['total_orders'] = (int)bv_sd_scalar($db,
-            "SELECT COUNT(DISTINCT o.id) FROM orders o WHERE o.id IN ({$orderOwnerSubquery}) {$periodWhere}",
-            array_merge($orderOwnerParams,$periodParams)
-        );
-        if ($hasOCol('status')) {
-            $osRows = bv_sd_rows($db,
-                "SELECT o.status,COUNT(DISTINCT o.id) AS cnt FROM orders o WHERE o.id IN ({$orderOwnerSubquery}) {$periodWhere} GROUP BY o.status",
-                array_merge($orderOwnerParams,$periodParams)
-            );
-            $statusMap = ['pending'=>'pending','pending_payment'=>'pending_payment','reserved'=>'pending',
-                          'paid'=>'paid','paid-awaiting-verify'=>'paid','confirmed'=>'paid',
-                          'processing'=>'processing','packing'=>'processing','shipped'=>'shipped',
-                          'completed'=>'completed','cancelled'=>'cancelled','refunded'=>'refunded'];
-            foreach ($osRows as $or2) {
-                $s=bv_sd_clean($or2['status']??'');
-                $bucket=$statusMap[$s]??null;
-                if ($bucket && isset($orderSummary[$bucket])) { $orderSummary[$bucket]+=(int)($or2['cnt']??0); }
+            if (function_exists('getallheaders')) {
+                $headers = getallheaders();
+                foreach ($headers as $headerName => $value) {
+                    if (strtolower((string) $headerName) === 'authorization' && trim((string) $value) !== '') {
+                        return trim((string) $value);
+                    }
+                }
             }
         }
 
-        // Sales summary — from order_items only (never orders.total)
-        $paidOrderStatuses = "'paid','paid-awaiting-verify','confirmed','processing','packing','shipped','completed','refunded'";
-        $paidWhereClause   = $hasOCol('payment_status')
-            ? "(o.payment_status='paid' OR o.status IN ({$paidOrderStatuses}))"
-            : "o.status IN ({$paidOrderStatuses})";
+        return null;
+    }
+}
 
-        if ($oiSellerCol!==null) {
-            $grossRow = bv_sd_row($db,
-                "SELECT COALESCE(SUM({$ltExpr}),0) AS gross
-                 FROM order_items oi
-                 INNER JOIN orders o ON o.id=oi.order_id
-                 WHERE {$oiWhere} AND o.id IN ({$orderOwnerSubquery}) {$periodWhere}",
-                array_merge([$filterSellerId],$orderOwnerParams,$periodParams)
-            );
-            $paidRow = bv_sd_row($db,
-                "SELECT COALESCE(SUM({$ltExpr}),0) AS paid_sum,
-                        COALESCE(SUM(CASE WHEN oi.quantity IS NOT NULL THEN oi.quantity ELSE oi.qty END),COUNT(*)) AS sold_cnt
-                 FROM order_items oi
-                 INNER JOIN orders o ON o.id=oi.order_id
-                 WHERE {$oiWhere} AND o.id IN ({$orderOwnerSubquery}) AND {$paidWhereClause} {$periodWhere}",
-                array_merge([$filterSellerId],$orderOwnerParams,$periodParams)
-            );
-        } else {
-            $grossRow = bv_sd_row($db,
-                "SELECT COALESCE(SUM({$ltExpr}),0) AS gross
-                 FROM order_items oi
-                 INNER JOIN orders o ON o.id=oi.order_id
-                 INNER JOIN listings lx ON lx.id=oi.listing_id
-                 WHERE lx.`{$listingOwnerCol}`=? AND o.id IN ({$orderOwnerSubquery}) {$periodWhere}",
-                array_merge([$filterSellerId],$orderOwnerParams,$periodParams)
-            );
-            $paidRow = bv_sd_row($db,
-                "SELECT COALESCE(SUM({$ltExpr}),0) AS paid_sum,
-                        COALESCE(SUM(CASE WHEN oi.quantity IS NOT NULL THEN oi.quantity ELSE oi.qty END),COUNT(*)) AS sold_cnt
-                 FROM order_items oi
-                 INNER JOIN orders o ON o.id=oi.order_id
-                 INNER JOIN listings lx ON lx.id=oi.listing_id
-                 WHERE lx.`{$listingOwnerCol}`=? AND o.id IN ({$orderOwnerSubquery}) AND {$paidWhereClause} {$periodWhere}",
-                array_merge([$filterSellerId],$orderOwnerParams,$periodParams)
-            );
+if (!function_exists('bv_sd_active_value')) {
+    function bv_sd_active_value($value): bool
+    {
+        $normalized = strtolower(trim((string) $value));
+        return in_array($normalized, ['active', '1', 'enabled', 'verified'], true);
+    }
+}
+
+if (!function_exists('bv_sd_clean_string')) {
+    function bv_sd_clean_string($value): ?string
+    {
+        if ($value === null) {
+            return null;
         }
+        $value = trim(htmlspecialchars_decode(strip_tags((string) $value), ENT_QUOTES | ENT_HTML5));
+        return $value === '' ? null : $value;
+    }
+}
 
-        $salesSummary['seller_gross_sales'] = round(bv_sd_float($grossRow['gross']??0),2);
-        $salesSummary['seller_paid_sales']  = round(bv_sd_float($paidRow['paid_sum']??0),2);
-        $salesSummary['sold_item_count']    = bv_sd_int($paidRow['sold_cnt']??0);
+if (!function_exists('bv_sd_int_value')) {
+    function bv_sd_int_value($value): int
+    {
+        return is_numeric($value) ? (int) $value : 0;
+    }
+}
 
-        // Refunded amount — seller-owned refund items only
-        if ($hasRefItems) {
-            $riCols   = bv_seller_dashboard_columns($db,'order_refund_items');
-            $hasRiCol = static fn(string $c): bool => in_array($c,$riCols,true);
-            $rRefAmtCol = $hasRiCol('actual_refund_after_fee')?'ri.actual_refund_after_fee'
-                        : ($hasRiCol('actual_refunded_amount')?'ri.actual_refunded_amount'
-                        : ($hasRiCol('approved_refund_amount')?'ri.approved_refund_amount':'0'));
-            $rCols    = bv_seller_dashboard_columns($db,'order_refunds');
-            $hasRCol  = static fn(string $c): bool => in_array($c,$rCols,true);
-            $refStatusWhere = $hasRCol('status') ? "AND r.status IN ('refunded','partially_refunded')" : '';
+if (!function_exists('bv_sd_float_value')) {
+    function bv_sd_float_value($value): float
+    {
+        return is_numeric($value) ? (float) $value : 0.0;
+    }
+}
 
-            if ($oiSellerCol!==null) {
-                $refRow = bv_sd_row($db,
-                    "SELECT COALESCE(SUM({$rRefAmtCol}),0) AS refunded
-                     FROM order_refund_items ri
-                     INNER JOIN order_refunds r ON r.id=ri.refund_id
-                     INNER JOIN order_items oi ON oi.id=ri.order_item_id
-                     WHERE oi.`{$oiSellerCol}`=? {$refStatusWhere}
-                       AND r.order_id IN ({$orderOwnerSubquery}) {$periodWhere}",
-                    array_merge([$filterSellerId],$orderOwnerParams,$periodParams)
+if (!function_exists('bv_sd_abs_url')) {
+    function bv_sd_abs_url($path): ?string
+    {
+        $path = bv_sd_clean_string($path);
+        if ($path === null) {
+            return null;
+        }
+        if (preg_match('#^https?://#i', $path)) {
+            return $path;
+        }
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'https';
+        $host = $_SERVER['HTTP_HOST'] ?? 'www.bettavaro.com';
+        return $scheme . '://' . $host . '/' . ltrim($path, '/');
+    }
+}
+
+if (!function_exists('bv_sd_placeholders')) {
+    function bv_sd_placeholders(array $values): string
+    {
+        return implode(', ', array_fill(0, count($values), '?'));
+    }
+}
+
+if (!function_exists('bv_sd_status_where')) {
+    function bv_sd_status_where(string $alias, string $column, array $statuses, array &$params): string
+    {
+        foreach ($statuses as $status) {
+            $params[] = $status;
+        }
+        return $alias . '.' . bv_sd_ident($column) . ' IN (' . bv_sd_placeholders($statuses) . ')';
+    }
+}
+
+if (!function_exists('bv_sd_count')) {
+    function bv_sd_count(object $db, string $sql, array $params = []): int
+    {
+        try {
+            return bv_sd_int_value(bv_sd_scalar($db, $sql, $params, 0));
+        } catch (Throwable $e) {
+            bv_sd_log('Count query failed: ' . $e->getMessage());
+            return 0;
+        }
+    }
+}
+
+if (!function_exists('bv_sd_order_paid_filter')) {
+    function bv_sd_order_paid_filter(?array $orderColumns, array &$params): string
+    {
+        $clauses = [];
+        if (bv_sd_has_col($orderColumns, 'status')) {
+            $statuses = ['paid', 'confirmed', 'processing', 'packing'];
+            foreach ($statuses as $status) {
+                $params[] = $status;
+            }
+            $clauses[] = 'o.' . bv_sd_ident(bv_sd_col($orderColumns, 'status')) . ' IN (' . bv_sd_placeholders($statuses) . ')';
+        }
+        if (bv_sd_has_col($orderColumns, 'payment_status')) {
+            $statuses = ['paid', 'confirmed', 'processing'];
+            foreach ($statuses as $status) {
+                $params[] = $status;
+            }
+            $clauses[] = 'o.' . bv_sd_ident(bv_sd_col($orderColumns, 'payment_status')) . ' IN (' . bv_sd_placeholders($statuses) . ')';
+        }
+        return $clauses ? ' AND (' . implode(' OR ', $clauses) . ')' : '';
+    }
+}
+
+if (!function_exists('bv_sd_select_expr')) {
+    function bv_sd_select_expr(?array $columns, array $candidates, string $alias, string $fallback = 'NULL'): string
+    {
+        $column = bv_sd_first_col($columns, $candidates);
+        return ($column !== null ? $alias . '.' . bv_sd_ident($column) : $fallback);
+    }
+}
+
+try {
+    $authorization = bv_sd_header('Authorization');
+    if ($authorization === null || !preg_match('/^Bearer\s+(.+)$/i', $authorization, $matches)) {
+        bv_sd_error('token_missing', 'Bearer token is required.', 401);
+    }
+
+    $plainToken = trim($matches[1]);
+    if ($plainToken === '') {
+        bv_sd_error('token_missing', 'Bearer token is required.', 401);
+    }
+
+    $db = bv_sd_db();
+    if (!$db) {
+        bv_sd_error('db_unavailable', 'Database connection is unavailable.', 503);
+    }
+
+    $tokenColumns = bv_sd_columns($db, 'mobile_auth_tokens');
+    if ($tokenColumns === null) {
+        bv_sd_error('token_table_missing', 'Token table is unavailable.', 500);
+    }
+
+    $userColumns = bv_sd_columns($db, 'users');
+    if ($userColumns === null || !bv_sd_has_col($userColumns, 'id') || !bv_sd_has_col($tokenColumns, 'user_id')) {
+        bv_sd_error('server_error', 'Authentication tables are not configured correctly.', 500);
+    }
+
+    $tokenHash = hash('sha256', $plainToken);
+    $tokenPredicates = [];
+    $tokenParams = [];
+    if (bv_sd_has_col($tokenColumns, 'token_hash')) {
+        $tokenPredicates[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'token_hash')) . ' = ?';
+        $tokenParams[] = $tokenHash;
+    }
+    if (bv_sd_has_col($tokenColumns, 'token')) {
+        $tokenPredicates[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'token')) . ' IN (?, ?)';
+        $tokenParams[] = $tokenHash;
+        $tokenParams[] = $plainToken;
+    }
+    if (bv_sd_has_col($tokenColumns, 'plain_token')) {
+        $tokenPredicates[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'plain_token')) . ' = ?';
+        $tokenParams[] = $plainToken;
+    }
+    if (!$tokenPredicates) {
+        bv_sd_error('server_error', 'Token table is not configured correctly.', 500);
+    }
+
+    $where = ['(' . implode(' OR ', $tokenPredicates) . ')'];
+    if (bv_sd_has_col($tokenColumns, 'revoked_at')) {
+        $where[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'revoked_at')) . ' IS NULL';
+    }
+    if (bv_sd_has_col($tokenColumns, 'revoked')) {
+        $where[] = 'COALESCE(mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'revoked')) . ', 0) = 0';
+    }
+    if (bv_sd_has_col($tokenColumns, 'is_revoked')) {
+        $where[] = 'COALESCE(mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'is_revoked')) . ', 0) = 0';
+    }
+
+    $userSelectWanted = ['id', 'first_name', 'last_name', 'name', 'email', 'phone', 'role', 'account_status', 'status'];
+    $select = [];
+    foreach ($userSelectWanted as $column) {
+        if (bv_sd_has_col($userColumns, $column)) {
+            $actual = bv_sd_col($userColumns, $column);
+            $select[] = 'u.' . bv_sd_ident($actual) . ' AS ' . bv_sd_ident($actual);
+        }
+    }
+    if (bv_sd_has_col($tokenColumns, 'id')) {
+        $select[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'id')) . ' AS __token_id';
+    }
+    if (bv_sd_has_col($tokenColumns, 'expires_at')) {
+        $select[] = 'mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'expires_at')) . ' AS __token_expires_at';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select) . ' FROM ' . bv_sd_ident('mobile_auth_tokens') . ' mat';
+    $sql .= ' INNER JOIN ' . bv_sd_ident('users') . ' u ON u.' . bv_sd_ident(bv_sd_col($userColumns, 'id')) . ' = mat.' . bv_sd_ident(bv_sd_col($tokenColumns, 'user_id'));
+    $sql .= ' WHERE ' . implode(' AND ', $where) . ' LIMIT 1';
+
+    $authRow = bv_sd_fetch_one($db, $sql, $tokenParams);
+    if (!$authRow) {
+        bv_sd_error('token_invalid', 'Bearer token is invalid.', 401);
+    }
+
+    if (bv_sd_has_col($tokenColumns, 'expires_at')) {
+        $expiresAtRaw = $authRow['__token_expires_at'] ?? null;
+        $expiresAt = $expiresAtRaw !== null ? strtotime((string) $expiresAtRaw) : false;
+        if ($expiresAt === false || $expiresAt <= time()) {
+            bv_sd_error('token_expired', 'Bearer token has expired.', 401);
+        }
+    }
+
+    $accountStatusActive = false;
+    if (bv_sd_has_col($userColumns, 'account_status')) {
+        $accountStatusActive = bv_sd_active_value($authRow[bv_sd_col($userColumns, 'account_status')] ?? null);
+        if (!$accountStatusActive) {
+            bv_sd_error('account_inactive', 'User account is inactive.', 403);
+        }
+    }
+    if (!$accountStatusActive && bv_sd_has_col($userColumns, 'status') && !bv_sd_active_value($authRow[bv_sd_col($userColumns, 'status')] ?? null)) {
+        bv_sd_error('account_inactive', 'User account is inactive.', 403);
+    }
+
+    $role = strtolower(trim((string) ($authRow[bv_sd_col($userColumns, 'role') ?? 'role'] ?? 'user')));
+    if (!in_array($role, ['seller', 'admin'], true)) {
+        bv_sd_error('seller_required', 'Seller access is required.', 403);
+    }
+
+    if (bv_sd_has_col($tokenColumns, 'last_used_at')) {
+        try {
+            if (bv_sd_has_col($tokenColumns, 'id') && isset($authRow['__token_id'])) {
+                bv_sd_execute(
+                    $db,
+                    'UPDATE ' . bv_sd_ident('mobile_auth_tokens') . ' SET ' . bv_sd_ident(bv_sd_col($tokenColumns, 'last_used_at')) . ' = NOW() WHERE ' . bv_sd_ident(bv_sd_col($tokenColumns, 'id')) . ' = ? LIMIT 1',
+                    [bv_sd_int_value($authRow['__token_id'])]
                 );
             } else {
-                $refRow = bv_sd_row($db,
-                    "SELECT COALESCE(SUM({$rRefAmtCol}),0) AS refunded
-                     FROM order_refund_items ri
-                     INNER JOIN order_refunds r ON r.id=ri.refund_id
-                     INNER JOIN listings lx ON lx.id=ri.listing_id AND lx.`{$listingOwnerCol}`=?
-                     WHERE 1=1 {$refStatusWhere}
-                       AND r.order_id IN ({$orderOwnerSubquery}) {$periodWhere}",
-                    array_merge([$filterSellerId],$orderOwnerParams,$periodParams)
+                $updateWhere = array_map(static fn(string $predicate): string => str_replace('mat.', '', $predicate), $where);
+                bv_sd_execute(
+                    $db,
+                    'UPDATE ' . bv_sd_ident('mobile_auth_tokens') . ' SET ' . bv_sd_ident(bv_sd_col($tokenColumns, 'last_used_at')) . ' = NOW() WHERE ' . implode(' AND ', $updateWhere) . ' LIMIT 1',
+                    $tokenParams
                 );
             }
-            $salesSummary['seller_refunded_amount'] = round(bv_sd_float($refRow['refunded']??0),2);
+        } catch (Throwable $e) {
+            bv_sd_log('last_used_at update failed: ' . $e->getMessage());
         }
-        $salesSummary['seller_net_sales'] = round(
-            $salesSummary['seller_paid_sales'] - $salesSummary['seller_refunded_amount'],2
-        );
+    }
 
-        // Fulfillment summary — seller-owned order_items with fulfillment_status
-        if ($oiSellerCol!==null && in_array('fulfillment_status',$oiCols2,true)) {
-            $fsRows = bv_sd_rows($db,
-                "SELECT COALESCE(oi.fulfillment_status,'pending') AS fs,COUNT(*) AS cnt
-                 FROM order_items oi
-                 INNER JOIN orders o ON o.id=oi.order_id
-                 WHERE oi.`{$oiSellerCol}`=? AND o.id IN ({$orderOwnerSubquery})
-                   AND o.status NOT IN ('cancelled','refunded')
-                 GROUP BY oi.fulfillment_status",
-                array_merge([$filterSellerId],$orderOwnerParams)
-            );
-            foreach ($fsRows as $fr) {
-                $s=bv_sd_clean($fr['fs']??'pending');
-                $c=(int)($fr['cnt']??0);
-                if (in_array($s,['','pending','cancelled'],true)) { $fulfillmentSummary['to_ship']+=$c; }
-                elseif ($s==='processing') { $fulfillmentSummary['processing']+=$c; }
-                elseif ($s==='shipped')    { $fulfillmentSummary['shipped']+=$c; }
-                elseif ($s==='completed')  { $fulfillmentSummary['completed']+=$c; }
-                else { $fulfillmentSummary['to_ship']+=$c; }
-            }
-        }
+    $userId = bv_sd_int_value($authRow[bv_sd_col($userColumns, 'id')] ?? 0);
+    $nameParts = [];
+    if (bv_sd_has_col($userColumns, 'first_name')) {
+        $nameParts[] = bv_sd_clean_string($authRow[bv_sd_col($userColumns, 'first_name')] ?? null);
+    }
+    if (bv_sd_has_col($userColumns, 'last_name')) {
+        $nameParts[] = bv_sd_clean_string($authRow[bv_sd_col($userColumns, 'last_name')] ?? null);
+    }
+    $nameParts = array_values(array_filter($nameParts, static fn($value): bool => $value !== null && $value !== ''));
+    $name = $nameParts ? implode(' ', $nameParts) : bv_sd_clean_string($authRow[bv_sd_col($userColumns, 'name') ?? 'name'] ?? null);
+    $seller = [
+        'id' => $userId,
+        'name' => $name,
+        'email' => bv_sd_clean_string($authRow[bv_sd_col($userColumns, 'email') ?? 'email'] ?? null),
+        'role' => $role,
+    ];
 
-        // Recent orders — latest 5 seller-owned
-        $roSelCols=['o.id'];
-        foreach (['order_code','status','payment_status','payment_provider','currency','total','buyer_name','buyer_email','user_id','paid_at','created_at'] as $c) {
-            if ($hasOCol($c)) { $roSelCols[]="o.`{$c}`"; }
-        }
-        $roOrderBy = $hasOCol('created_at') ? 'ORDER BY o.created_at DESC,o.id DESC' : 'ORDER BY o.id DESC';
-        $roRows = bv_sd_rows($db,
-            'SELECT '.implode(', ',$roSelCols)." FROM orders o WHERE o.id IN ({$orderOwnerSubquery}) {$roOrderBy} LIMIT 5",
-            $orderOwnerParams
-        );
-
-        if (!empty($roRows)) {
-            $roIds = array_map(static fn($r)=>(int)$r['id'],$roRows);
-            $roph  = implode(', ',array_fill(0,count($roIds),'?'));
-
-            // Batch items for recent orders
-            $roItemParams = ($oiSellerCol!==null) ? array_merge([$filterSellerId],$roIds) : array_merge([$filterSellerId],$roIds);
-            $roItemJoin   = ($oiSellerCol!==null) ? '' : " INNER JOIN listings lxi ON lxi.id=oi.listing_id AND lxi.`{$listingOwnerCol}`=?";
-            $roItemWhere  = ($oiSellerCol!==null) ? "oi.`{$oiSellerCol}`=? AND oi.order_id IN ({$roph})" : "oi.order_id IN ({$roph})";
-            $roItemRows = bv_sd_rows($db,
-                "SELECT oi.order_id,COUNT(*) AS item_count,
-                        COALESCE(SUM(oi.line_total),SUM(oi.qty*oi.unit_price),0) AS subtotal,
-                        GROUP_CONCAT(COALESCE(oi.fulfillment_status,'') SEPARATOR ',') AS fcsv
-                 FROM order_items oi{$roItemJoin}
-                 WHERE {$roItemWhere}
-                 GROUP BY oi.order_id",
-                $roItemParams
-            );
-            $roItemMap=[];
-            foreach ($roItemRows as $rim) { $roItemMap[(int)$rim['order_id']]=$rim; }
-
-            // Latest refund per order
-            $roRefMap=[];
-            if ($hasRefunds) {
-                $rfCols=bv_seller_dashboard_columns($db,'order_refunds');
-                $rfSelCols=['order_id','id'];
-                foreach (['refund_code','status'] as $c) { if(in_array($c,$rfCols,true)) $rfSelCols[]=$c; }
-                $rfRows=bv_sd_rows($db,
-                    'SELECT '.implode(',',$rfSelCols)." FROM order_refunds WHERE order_id IN ({$roph}) ORDER BY id DESC",
-                    $roIds
-                );
-                foreach ($rfRows as $rfr) {
-                    $oid=(int)$rfr['order_id'];
-                    if (!isset($roRefMap[$oid])) $roRefMap[$oid]=$rfr;
+    $sellerApplicationColumns = bv_sd_columns($db, 'seller_applications');
+    if ($sellerApplicationColumns !== null && bv_sd_has_col($sellerApplicationColumns, 'user_id')) {
+        try {
+            $appSelect = [];
+            $appMap = [
+                'farm_name' => ['farm_name'],
+                'province' => ['province', 'farm_province'],
+                'country' => ['country', 'farm_country'],
+                'phone' => ['phone', 'farm_phone'],
+            ];
+            foreach ($appMap as $field => $candidates) {
+                $column = bv_sd_first_col($sellerApplicationColumns, $candidates);
+                if ($column !== null) {
+                    $appSelect[$field] = $column;
                 }
             }
-
-            // Fulfillment derive
-            $deriveF = static function(string $csv,string $os): array {
-                $ss=array_filter(array_map('trim',explode(',',$csv)));
-                if (empty($ss)) {
-                    return match($os) {
-                        'shipped'   =>['status'=>'shipped',  'label'=>'Shipped'],
-                        'completed' =>['status'=>'completed','label'=>'Completed'],
-                        'paid','confirmed','processing','packing'=>['status'=>'pending','label'=>'To Ship'],
-                        default     =>['status'=>'unknown',  'label'=>'Unknown'],
-                    };
+            if ($appSelect) {
+                $appWhere = ['sa.' . bv_sd_ident(bv_sd_col($sellerApplicationColumns, 'user_id')) . ' = ?'];
+                $appParams = [$userId];
+                if (bv_sd_has_col($sellerApplicationColumns, 'application_status')) {
+                    $appWhere[] = 'sa.' . bv_sd_ident(bv_sd_col($sellerApplicationColumns, 'application_status')) . ' = ?';
+                    $appParams[] = 'approved';
+                } elseif (bv_sd_has_col($sellerApplicationColumns, 'status')) {
+                    $appWhere[] = 'sa.' . bv_sd_ident(bv_sd_col($sellerApplicationColumns, 'status')) . ' = ?';
+                    $appParams[] = 'approved';
                 }
-                $u=array_unique($ss);
-                if (count($u)===1) {
-                    return match($u[0]) {
-                        'completed'  =>['status'=>'completed',  'label'=>'Completed'],
-                        'shipped'    =>['status'=>'shipped',    'label'=>'Shipped'],
-                        'processing' =>['status'=>'processing', 'label'=>'Preparing'],
-                        default      =>['status'=>'pending',    'label'=>'To Ship'],
-                    };
+                $orderColumn = bv_sd_first_col($sellerApplicationColumns, ['reviewed_at', 'approved_at', 'updated_at', 'created_at', 'id']);
+                $appSqlParts = [];
+                foreach ($appSelect as $field => $column) {
+                    $appSqlParts[] = 'sa.' . bv_sd_ident($column) . ' AS ' . bv_sd_ident($field);
                 }
-                $hS=in_array('shipped',$ss,true);$hC=in_array('completed',$ss,true);
-                $hP=in_array('processing',$ss,true);$hPe=in_array('pending',$ss,true)||in_array('',$ss,true);
-                if (($hS||$hC)&&($hPe||$hP)) return['status'=>'mixed','label'=>'Mixed'];
-                if ($hS&&$hC) return['status'=>'mixed','label'=>'Mixed'];
-                if ($hP) return['status'=>'processing','label'=>'Preparing'];
-                return['status'=>'pending','label'=>'To Ship'];
-            };
+                $appSql = 'SELECT ' . implode(', ', $appSqlParts) . ' FROM ' . bv_sd_ident('seller_applications') . ' sa WHERE ' . implode(' AND ', $appWhere);
+                if ($orderColumn !== null) {
+                    $appSql .= ' ORDER BY sa.' . bv_sd_ident($orderColumn) . ' DESC';
+                }
+                $appSql .= ' LIMIT 1';
+                $application = bv_sd_fetch_one($db, $appSql, $appParams);
+                if ($application) {
+                    foreach ($appMap as $field => $_) {
+                        if (array_key_exists($field, $application)) {
+                            $seller[$field] = bv_sd_clean_string($application[$field]);
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            bv_sd_log('Seller application lookup failed: ' . $e->getMessage());
+        }
+    }
 
-            foreach ($roRows as $ro) {
-                $roid=(int)$ro['id'];
-                $im=$roItemMap[$roid]??null;
-                $rf=$roRefMap[$roid]??null;
-                $fv=$deriveF((string)($im['fcsv']??''),bv_sd_clean($ro['status']??''));
-                $recentOrders[]=[
-                    'id'                =>$roid,
-                    'order_code'        =>bv_sd_clean($ro['order_code']??''),
-                    'status'            =>bv_sd_clean($ro['status']??''),
-                    'payment_status'    =>bv_sd_clean($ro['payment_status']??''),
-                    'currency'          =>bv_sd_clean($ro['currency']??'USD'),
-                    'order_total'       =>round(bv_sd_float($ro['total']??0),2),
-                    'seller_subtotal'   =>round(bv_sd_float($im['subtotal']??0),2),
-                    'seller_item_count' =>bv_sd_int($im['item_count']??0),
-                    'buyer'             =>['id'=>bv_sd_int($ro['user_id']??0)?:null,'name'=>bv_sd_clean($ro['buyer_name']??''),'email'=>bv_sd_clean($ro['buyer_email']??'')],
-                    'fulfillment'       =>$fv,
-                    'latest_refund'     =>['id'=>$rf?bv_sd_int($rf['id']):null,'status'=>$rf?bv_sd_clean($rf['status']??''):'','refund_code'=>$rf?bv_sd_clean($rf['refund_code']??''):''],
-                    'created_at'        =>bv_sd_clean($ro['created_at']??''),
-                    'paid_at'           =>bv_sd_clean($ro['paid_at']??''),
+    $summary = [
+        'active_listings' => 0,
+        'draft_listings' => 0,
+        'sold_listings' => 0,
+        'total_orders' => 0,
+        'pending_fulfillment' => 0,
+        'shipped_orders' => 0,
+        'completed_orders' => 0,
+        'pending_refunds' => 0,
+        'open_offers' => 0,
+    ];
+    $recentOrders = [];
+    $recentListings = [];
+
+    $listingColumns = bv_sd_columns($db, 'listings');
+    $listingSellerCol = bv_sd_first_col($listingColumns, ['seller_id', 'seller_user_id', 'user_id']);
+    $listingIdCol = bv_sd_col($listingColumns, 'id');
+
+    if ($listingColumns !== null && $listingSellerCol !== null && $listingIdCol !== null) {
+        if (bv_sd_has_col($listingColumns, 'status')) {
+            $params = [$userId];
+            $summary['active_listings'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listings') . ' l WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ? AND ' . bv_sd_status_where('l', bv_sd_col($listingColumns, 'status'), ['active', 'available', 'published'], $params), $params);
+            $params = [$userId];
+            $summary['draft_listings'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listings') . ' l WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ? AND ' . bv_sd_status_where('l', bv_sd_col($listingColumns, 'status'), ['draft', 'pending', 'inactive'], $params), $params);
+        }
+
+        $soldParts = [];
+        $soldParams = [$userId];
+        if (bv_sd_has_col($listingColumns, 'status')) {
+            $soldParts[] = bv_sd_status_where('l', bv_sd_col($listingColumns, 'status'), ['sold', 'completed'], $soldParams);
+        }
+        if (bv_sd_has_col($listingColumns, 'sale_status')) {
+            $soldParts[] = bv_sd_status_where('l', bv_sd_col($listingColumns, 'sale_status'), ['sold', 'completed'], $soldParams);
+        }
+        if ($soldParts) {
+            $summary['sold_listings'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listings') . ' l WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ? AND (' . implode(' OR ', $soldParts) . ')', $soldParams);
+        }
+
+        $listingTitleExpr = bv_sd_select_expr($listingColumns, ['title', 'name'], 'l');
+        $listingStatusExpr = bv_sd_select_expr($listingColumns, ['status'], 'l');
+        $listingSaleStatusExpr = bv_sd_select_expr($listingColumns, ['sale_status'], 'l');
+        $listingPriceExpr = bv_sd_select_expr($listingColumns, ['price', 'unit_price', 'amount'], 'l', '0');
+        $listingCurrencyExpr = bv_sd_select_expr($listingColumns, ['currency'], 'l', "'USD'");
+        $listingImageExpr = bv_sd_select_expr($listingColumns, ['cover_image', 'image_url', 'image', 'photo_url', 'thumbnail_url'], 'l');
+        $listingCreatedExpr = bv_sd_select_expr($listingColumns, ['created_at', 'published_at', 'updated_at'], 'l');
+        $listingOrderCol = bv_sd_first_col($listingColumns, ['created_at', 'published_at', 'updated_at', 'id']);
+
+        try {
+            $rows = bv_sd_fetch_all(
+                $db,
+                'SELECT l.' . bv_sd_ident($listingIdCol) . ' AS id, ' . $listingTitleExpr . ' AS title, ' . $listingStatusExpr . ' AS status, ' . $listingSaleStatusExpr . ' AS sale_status, ' . $listingPriceExpr . ' AS price, ' . $listingCurrencyExpr . ' AS currency, ' . $listingImageExpr . ' AS image_url, ' . $listingCreatedExpr . ' AS created_at FROM ' . bv_sd_ident('listings') . ' l WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ? ORDER BY l.' . bv_sd_ident($listingOrderCol ?? $listingIdCol) . ' DESC LIMIT 5',
+                [$userId]
+            );
+            foreach ($rows as $row) {
+                $recentListings[] = [
+                    'id' => bv_sd_int_value($row['id'] ?? 0),
+                    'title' => bv_sd_clean_string($row['title'] ?? null),
+                    'status' => bv_sd_clean_string($row['status'] ?? null),
+                    'sale_status' => bv_sd_clean_string($row['sale_status'] ?? null),
+                    'price' => bv_sd_float_value($row['price'] ?? 0),
+                    'currency' => bv_sd_clean_string($row['currency'] ?? null) ?: 'USD',
+                    'image_url' => bv_sd_abs_url($row['image_url'] ?? null),
+                    'created_at' => bv_sd_clean_string($row['created_at'] ?? null),
                 ];
             }
+        } catch (Throwable $e) {
+            bv_sd_log('Recent listings query failed: ' . $e->getMessage());
+            $recentListings = [];
         }
     }
 
-    // ── Review summary ────────────────────────────────────────────────────────
-    $reviewSummary = ['average_rating'=>0.0,'review_count'=>0,'five_star_count'=>0,'low_rating_count'=>0];
-    if ($hasReviews && $lOwnerCol!==null) {
-        $rvCols   = bv_seller_dashboard_columns($db,'listing_reviews');
-        $hasRvCol = static fn(string $c): bool => in_array($c,$rvCols,true);
-        $rvRating = $hasRvCol('rating')?'rating':($hasRvCol('score')?'score':null);
-        $rvLinkId = $hasRvCol('listing_id')?'listing_id':($hasRvCol('item_id')?'item_id':null);
-        if ($rvRating && $rvLinkId) {
-            $rvApprWhere = $hasRvCol('status') ? "AND rv.status='approved'" : '';
-            $rvRow = bv_sd_row($db,
-                "SELECT COALESCE(AVG(rv.`{$rvRating}`),0) AS avg_r,COUNT(*) AS cnt,
-                        SUM(CASE WHEN rv.`{$rvRating}`>=5 THEN 1 ELSE 0 END) AS five_cnt,
-                        SUM(CASE WHEN rv.`{$rvRating}`<=2 THEN 1 ELSE 0 END) AS low_cnt
-                 FROM listing_reviews rv
-                 INNER JOIN listings l ON l.id=rv.`{$rvLinkId}` AND l.`{$lOwnerCol}`=?
-                 WHERE 1=1 {$rvApprWhere}",
-                [$filterSellerId]
-            );
-            if ($rvRow) {
-                $reviewSummary['average_rating']  = round(bv_sd_float($rvRow['avg_r']??0),2);
-                $reviewSummary['review_count']    = bv_sd_int($rvRow['cnt']??0);
-                $reviewSummary['five_star_count'] = bv_sd_int($rvRow['five_cnt']??0);
-                $reviewSummary['low_rating_count']= bv_sd_int($rvRow['low_cnt']??0);
+    $orderColumns = bv_sd_columns($db, 'orders');
+    $orderItemColumns = bv_sd_columns($db, 'order_items');
+    $hasOrderChain = $orderColumns !== null && $orderItemColumns !== null && $listingColumns !== null && $listingSellerCol !== null && $listingIdCol !== null && bv_sd_has_col($orderColumns, 'id') && bv_sd_has_col($orderItemColumns, 'order_id') && bv_sd_has_col($orderItemColumns, 'listing_id');
+
+    if ($hasOrderChain) {
+        $orderIdCol = bv_sd_col($orderColumns, 'id');
+        $itemOrderCol = bv_sd_col($orderItemColumns, 'order_id');
+        $itemListingCol = bv_sd_col($orderItemColumns, 'listing_id');
+        $itemIdCol = bv_sd_col($orderItemColumns, 'id');
+
+        $baseJoin = ' FROM ' . bv_sd_ident('orders') . ' o INNER JOIN ' . bv_sd_ident('order_items') . ' oi ON oi.' . bv_sd_ident($itemOrderCol) . ' = o.' . bv_sd_ident($orderIdCol) . ' INNER JOIN ' . bv_sd_ident('listings') . ' l ON l.' . bv_sd_ident($listingIdCol) . ' = oi.' . bv_sd_ident($itemListingCol) . ' WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ?';
+
+        $summary['total_orders'] = bv_sd_count($db, 'SELECT COUNT(DISTINCT o.' . bv_sd_ident($orderIdCol) . ')' . $baseJoin, [$userId]);
+
+        $fulfillmentCol = bv_sd_first_col($orderItemColumns, ['fulfillment_status', 'seller_fulfillment_status', 'shipping_status']);
+        if ($fulfillmentCol !== null) {
+            $params = [$userId];
+            $whereStatus = bv_sd_status_where('oi', $fulfillmentCol, ['pending', 'processing'], $params);
+            $paidFilter = bv_sd_order_paid_filter($orderColumns, $params);
+            $summary['pending_fulfillment'] = bv_sd_count($db, 'SELECT COUNT(*)' . $baseJoin . ' AND ' . $whereStatus . $paidFilter, $params);
+
+            $params = [$userId];
+            $summary['shipped_orders'] = bv_sd_count($db, 'SELECT COUNT(DISTINCT o.' . bv_sd_ident($orderIdCol) . ')' . $baseJoin . ' AND ' . bv_sd_status_where('oi', $fulfillmentCol, ['shipped'], $params), $params);
+
+            $params = [$userId];
+            $summary['completed_orders'] = bv_sd_count($db, 'SELECT COUNT(DISTINCT o.' . bv_sd_ident($orderIdCol) . ')' . $baseJoin . ' AND ' . bv_sd_status_where('oi', $fulfillmentCol, ['completed'], $params), $params);
+        } elseif (bv_sd_has_col($orderColumns, 'status')) {
+            $params = [$userId];
+            $summary['pending_fulfillment'] = bv_sd_count($db, 'SELECT COUNT(*)' . $baseJoin . ' AND ' . bv_sd_status_where('o', bv_sd_col($orderColumns, 'status'), ['confirmed', 'paid', 'processing', 'packing'], $params), $params);
+
+            $params = [$userId];
+            $summary['shipped_orders'] = bv_sd_count($db, 'SELECT COUNT(DISTINCT o.' . bv_sd_ident($orderIdCol) . ')' . $baseJoin . ' AND ' . bv_sd_status_where('o', bv_sd_col($orderColumns, 'status'), ['shipped'], $params), $params);
+
+            $params = [$userId];
+            $summary['completed_orders'] = bv_sd_count($db, 'SELECT COUNT(DISTINCT o.' . bv_sd_ident($orderIdCol) . ')' . $baseJoin . ' AND ' . bv_sd_status_where('o', bv_sd_col($orderColumns, 'status'), ['completed'], $params), $params);
+        }
+
+        $lineTotalExpr = '0';
+        $lineTotalCol = bv_sd_first_col($orderItemColumns, ['line_total', 'total', 'subtotal', 'item_total']);
+        if ($lineTotalCol !== null) {
+            $lineTotalExpr = 'COALESCE(oi.' . bv_sd_ident($lineTotalCol) . ', 0)';
+        } else {
+            $unitCol = bv_sd_first_col($orderItemColumns, ['unit_price', 'price', 'sale_price']);
+            $qtyCol = bv_sd_first_col($orderItemColumns, ['quantity', 'qty']);
+            if ($unitCol !== null && $qtyCol !== null) {
+                $lineTotalExpr = 'COALESCE(oi.' . bv_sd_ident($unitCol) . ', 0) * COALESCE(oi.' . bv_sd_ident($qtyCol) . ', 1)';
+            } elseif ($unitCol !== null) {
+                $lineTotalExpr = 'COALESCE(oi.' . bv_sd_ident($unitCol) . ', 0)';
             }
+        }
+
+        $qtyExpr = bv_sd_has_col($orderItemColumns, 'quantity') ? 'COALESCE(oi.' . bv_sd_ident(bv_sd_col($orderItemColumns, 'quantity')) . ', 1)' : (bv_sd_has_col($orderItemColumns, 'qty') ? 'COALESCE(oi.' . bv_sd_ident(bv_sd_col($orderItemColumns, 'qty')) . ', 1)' : '1');
+        $orderCodeExpr = bv_sd_select_expr($orderColumns, ['order_code', 'code', 'order_number'], 'o');
+        $orderStatusExpr = bv_sd_select_expr($orderColumns, ['status'], 'o');
+        $paymentStatusExpr = bv_sd_select_expr($orderColumns, ['payment_status'], 'o');
+        $orderCurrencyExpr = bv_sd_select_expr($orderColumns, ['currency'], 'o', "'USD'");
+        $orderTotalExpr = bv_sd_select_expr($orderColumns, ['total', 'grand_total', 'total_amount', 'amount'], 'o', '0');
+        $orderCreatedExpr = bv_sd_select_expr($orderColumns, ['created_at', 'ordered_at', 'updated_at'], 'o');
+        $orderPaidExpr = bv_sd_select_expr($orderColumns, ['paid_at', 'payment_paid_at'], 'o');
+        $orderSortCol = bv_sd_first_col($orderColumns, ['created_at', 'ordered_at', 'updated_at', 'id']);
+        $firstTitleExpr = bv_sd_select_expr($listingColumns, ['title', 'name'], 'l');
+        $firstImageExpr = bv_sd_select_expr($listingColumns, ['cover_image', 'image_url', 'image', 'photo_url', 'thumbnail_url'], 'l');
+        $fulfillmentSummaryExpr = $fulfillmentCol !== null ? 'GROUP_CONCAT(DISTINCT oi.' . bv_sd_ident($fulfillmentCol) . ' ORDER BY oi.' . bv_sd_ident($fulfillmentCol) . ' SEPARATOR \', \')' : $orderStatusExpr;
+
+        try {
+            $rows = bv_sd_fetch_all(
+                $db,
+                'SELECT o.' . bv_sd_ident($orderIdCol) . ' AS id, ' . $orderCodeExpr . ' AS order_code, ' . $orderStatusExpr . ' AS status, ' . $paymentStatusExpr . ' AS payment_status, ' . $orderCurrencyExpr . ' AS currency, ' . $orderTotalExpr . ' AS total, COALESCE(SUM(' . $lineTotalExpr . '), 0) AS seller_subtotal, COALESCE(SUM(' . $qtyExpr . '), COUNT(*)) AS item_count, MIN(' . $firstTitleExpr . ') AS first_title, MIN(' . $firstImageExpr . ') AS first_image_url, ' . $orderCreatedExpr . ' AS created_at, ' . $orderPaidExpr . ' AS paid_at, ' . $fulfillmentSummaryExpr . ' AS fulfillment_status_summary' . $baseJoin . ' GROUP BY o.' . bv_sd_ident($orderIdCol) . ' ORDER BY o.' . bv_sd_ident($orderSortCol ?? $orderIdCol) . ' DESC LIMIT 5',
+                [$userId]
+            );
+            foreach ($rows as $row) {
+                $recentOrders[] = [
+                    'id' => bv_sd_int_value($row['id'] ?? 0),
+                    'order_code' => bv_sd_clean_string($row['order_code'] ?? null),
+                    'status' => bv_sd_clean_string($row['status'] ?? null),
+                    'payment_status' => bv_sd_clean_string($row['payment_status'] ?? null),
+                    'currency' => bv_sd_clean_string($row['currency'] ?? null) ?: 'USD',
+                    'total' => bv_sd_float_value($row['total'] ?? 0),
+                    'seller_subtotal' => bv_sd_float_value($row['seller_subtotal'] ?? 0),
+                    'item_count' => bv_sd_int_value($row['item_count'] ?? 0),
+                    'first_title' => bv_sd_clean_string($row['first_title'] ?? null),
+                    'first_image_url' => bv_sd_abs_url($row['first_image_url'] ?? null),
+                    'created_at' => bv_sd_clean_string($row['created_at'] ?? null),
+                    'paid_at' => bv_sd_clean_string($row['paid_at'] ?? null),
+                    'fulfillment_status_summary' => bv_sd_clean_string($row['fulfillment_status_summary'] ?? null),
+                ];
+            }
+        } catch (Throwable $e) {
+            bv_sd_log('Recent orders query failed: ' . $e->getMessage());
+            $recentOrders = [];
+        }
+
+        $refundColumns = bv_sd_columns($db, 'order_refunds');
+        $refundItemColumns = bv_sd_columns($db, 'order_refund_items');
+        if ($refundColumns !== null && $refundItemColumns !== null && bv_sd_has_col($refundColumns, 'id') && bv_sd_has_col($refundItemColumns, 'refund_id') && bv_sd_has_col($refundItemColumns, 'order_item_id') && $itemIdCol !== null) {
+            $params = [$userId];
+            $refundStatusSql = '';
+            if (bv_sd_has_col($refundColumns, 'status')) {
+                $refundStatusSql = ' AND ' . bv_sd_status_where('r', bv_sd_col($refundColumns, 'status'), ['pending_approval', 'approved', 'processing'], $params);
+            }
+            $summary['pending_refunds'] = bv_sd_count(
+                $db,
+                'SELECT COUNT(DISTINCT r.' . bv_sd_ident(bv_sd_col($refundColumns, 'id')) . ') FROM ' . bv_sd_ident('order_refunds') . ' r INNER JOIN ' . bv_sd_ident('order_refund_items') . ' ri ON ri.' . bv_sd_ident(bv_sd_col($refundItemColumns, 'refund_id')) . ' = r.' . bv_sd_ident(bv_sd_col($refundColumns, 'id')) . ' INNER JOIN ' . bv_sd_ident('order_items') . ' oi ON oi.' . bv_sd_ident($itemIdCol) . ' = ri.' . bv_sd_ident(bv_sd_col($refundItemColumns, 'order_item_id')) . ' INNER JOIN ' . bv_sd_ident('listings') . ' l ON l.' . bv_sd_ident($listingIdCol) . ' = oi.' . bv_sd_ident($itemListingCol) . ' WHERE l.' . bv_sd_ident($listingSellerCol) . ' = ?' . $refundStatusSql,
+                $params
+            );
         }
     }
 
-    // ── Ranking summary ───────────────────────────────────────────────────────
-    $rankingSummary = ['average_score'=>0.0,'top_score'=>0.0,'top_listing'=>null];
-    if ($lOwnerCol!==null && ($hasRanking||$hasRankCache)) {
-        $rankTable   = $hasRanking ? 'listing_ranking_scores' : 'listing_ranking_cache';
-        $rankCols    = bv_seller_dashboard_columns($db,$rankTable);
-        $rankScoreCol= in_array('final_score',$rankCols,true)?'final_score':(in_array('ranking_score',$rankCols,true)?'ranking_score':null);
-        $rankLinkCol = in_array('listing_id',$rankCols,true)?'listing_id':null;
-        if ($rankScoreCol && $rankLinkCol) {
-            $rankRow = bv_sd_row($db,
-                "SELECT COALESCE(AVG(r.`{$rankScoreCol}`),0) AS avg_s,COALESCE(MAX(r.`{$rankScoreCol}`),0) AS top_s
-                 FROM `{$rankTable}` r
-                 INNER JOIN listings l ON l.id=r.`{$rankLinkCol}` AND l.`{$lOwnerCol}`=?",
-                [$filterSellerId]
-            );
-            if ($rankRow) {
-                $rankingSummary['average_score'] = round(bv_sd_float($rankRow['avg_s']??0),4);
-                $rankingSummary['top_score']     = round(bv_sd_float($rankRow['top_s']??0),4);
-            }
-            if ($rankingSummary['top_score']>0) {
-                $topRankRow = bv_sd_row($db,
-                    "SELECT l.id,l.title,l.slug FROM listings l
-                     INNER JOIN `{$rankTable}` r ON r.`{$rankLinkCol}`=l.id
-                     WHERE l.`{$lOwnerCol}`=?
-                     ORDER BY r.`{$rankScoreCol}` DESC LIMIT 1",
-                    [$filterSellerId]
-                );
-                if ($topRankRow) {
-                    $slug=bv_sd_clean($topRankRow['slug']??'');
-                    $rankingSummary['top_listing']=[
-                        'id'    =>bv_sd_int($topRankRow['id']),
-                        'title' =>bv_sd_clean($topRankRow['title']??''),
-                        'url'   =>bv_sd_listing_url(bv_sd_int($topRankRow['id']),$slug),
-                    ];
-                }
-            }
-        }
+    $offerColumns = bv_sd_columns($db, 'listing_offers');
+    if ($offerColumns !== null && bv_sd_has_col($offerColumns, 'seller_user_id')) {
+        $params = [$userId];
+        $statusSql = bv_sd_has_col($offerColumns, 'status') ? ' AND ' . bv_sd_status_where('lo', bv_sd_col($offerColumns, 'status'), ['open', 'seller_countered', 'buyer_countered', 'seller_accepted', 'buyer_checkout_ready'], $params) : '';
+        $summary['open_offers'] = bv_sd_count($db, 'SELECT COUNT(*) FROM ' . bv_sd_ident('listing_offers') . ' lo WHERE lo.' . bv_sd_ident(bv_sd_col($offerColumns, 'seller_user_id')) . ' = ?' . $statusSql, $params);
     }
 
-    // ── Refund summary ────────────────────────────────────────────────────────
-    $refundSummary = ['pending_approval'=>0,'approved'=>0,'processing'=>0,'refunded'=>0,'rejected'=>0,'failed'=>0];
-    if ($hasRefunds && $orderOwnerSubquery!=='') {
-        $rCols2   = bv_seller_dashboard_columns($db,'order_refunds');
-        $hasRCol2 = static fn(string $c): bool => in_array($c,$rCols2,true);
-        if ($hasRCol2('status')) {
-            if ($hasRefItems && $oiSellerCol!==null) {
-                $rSumRows = bv_sd_rows($db,
-                    "SELECT r.status,COUNT(DISTINCT r.id) AS cnt
-                     FROM order_refunds r
-                     INNER JOIN order_refund_items ri ON ri.refund_id=r.id
-                     INNER JOIN order_items oi ON oi.id=ri.order_item_id
-                     WHERE oi.`{$oiSellerCol}`=? AND r.order_id IN ({$orderOwnerSubquery})
-                     GROUP BY r.status",
-                    array_merge([$filterSellerId],$orderOwnerParams)
-                );
-            } else {
-                $rSumRows = bv_sd_rows($db,
-                    "SELECT r.status,COUNT(DISTINCT r.id) AS cnt
-                     FROM order_refunds r
-                     WHERE r.order_id IN ({$orderOwnerSubquery})
-                     GROUP BY r.status",
-                    $orderOwnerParams
-                );
-            }
-            $refundBuckets = [
-                'draft'=>'pending_approval','pending_approval'=>'pending_approval',
-                'approved'=>'approved','partially_approved'=>'approved',
-                'processing'=>'processing',
-                'refunded'=>'refunded','partially_refunded'=>'refunded',
-                'rejected'=>'rejected','failed'=>'failed','cancelled'=>'failed',
-            ];
-            foreach ($rSumRows as $rsr) {
-                $s=bv_sd_clean($rsr['status']??'');
-                $bucket=$refundBuckets[$s]??null;
-                if ($bucket) { $refundSummary[$bucket]+=(int)($rsr['cnt']??0); }
-            }
-        }
-    }
-
-    // ── Balance summary ───────────────────────────────────────────────────────
-    $balanceSummary = ['available'=>0.0,'pending'=>0.0,'currency'=>'USD'];
-    if ($hasBalance) {
-        $beCols   = bv_seller_dashboard_columns($db,'seller_balance_entries');
-        $hasBECol = static fn(string $c): bool => in_array($c,$beCols,true);
-        if ($hasBECol('seller_id') && $hasBECol('amount') && $hasBECol('status')) {
-            $bAvail = bv_sd_scalar($db,
-                "SELECT COALESCE(SUM(amount),0) FROM seller_balance_entries WHERE seller_id=? AND status='available'",
-                [$filterSellerId],0.0
-            );
-            $bPend = bv_sd_scalar($db,
-                "SELECT COALESCE(SUM(amount),0) FROM seller_balance_entries WHERE seller_id=? AND status IN ('pending','on_hold')",
-                [$filterSellerId],0.0
-            );
-            $bCurRow = bv_sd_row($db,
-                "SELECT currency FROM seller_balance_entries WHERE seller_id=? AND status='available' LIMIT 1",
-                [$filterSellerId]
-            );
-            $balanceSummary['available'] = round(bv_sd_float($bAvail),2);
-            $balanceSummary['pending']   = round(bv_sd_float($bPend),2);
-            if ($bCurRow) { $balanceSummary['currency'] = strtoupper(bv_sd_clean($bCurRow['currency']??'USD'))?:'USD'; }
-        }
-    }
-
-    // ── Alerts ────────────────────────────────────────────────────────────────
     $alerts = [];
-    if ($refundSummary['pending_approval']>0) {
-        $alerts[]=['type'=>'refund','level'=>'warning','message'=>'You have refund requests waiting for approval.','count'=>$refundSummary['pending_approval']];
+    if ($summary['pending_fulfillment'] > 0) {
+        $alerts[] = [
+            'code' => 'pending_fulfillment',
+            'message' => 'You have orders pending fulfillment.',
+            'count' => $summary['pending_fulfillment'],
+        ];
     }
-    if ($fulfillmentSummary['to_ship']>0) {
-        $alerts[]=['type'=>'fulfillment','level'=>'info','message'=>'You have orders waiting to ship.','count'=>$fulfillmentSummary['to_ship']];
+    if ($summary['pending_refunds'] > 0) {
+        $alerts[] = [
+            'code' => 'pending_refunds',
+            'message' => 'You have refunds pending review or processing.',
+            'count' => $summary['pending_refunds'],
+        ];
     }
-    if ($reviewSummary['low_rating_count']>0) {
-        $alerts[]=['type'=>'review','level'=>'warning','message'=>'You have low-rating reviews to review.','count'=>$reviewSummary['low_rating_count']];
+    if ($summary['open_offers'] > 0) {
+        $alerts[] = [
+            'code' => 'open_offers',
+            'message' => 'You have open listing offers.',
+            'count' => $summary['open_offers'],
+        ];
     }
 
-    // ── Response ──────────────────────────────────────────────────────────────
-    bv_seller_dashboard_json(200,[
-        'ok'   => true,
+    bv_sd_json(200, [
+        'ok' => true,
         'data' => [
-            'seller' => [
-                'id'                 => $filterSellerId,
-                'name'               => $sellerName,
-                'email'              => $userEmail,
-                'role'               => $userRole,
-                'farm_name'          => $farmName,
-                'application_status' => $applicationStatus,
-                'profile_url'        => $siteBase.'/seller.php?id='.$filterSellerId,
-            ],
-            'period' => ['days'=>$days,'from'=>$dateFrom,'to'=>$dateTo],
-            'listing_summary'      => $listingSummary,
-            'order_summary'        => $orderSummary,
-            'sales_summary'        => $salesSummary,
-            'review_summary'       => $reviewSummary,
-            'ranking_summary'      => $rankingSummary,
-            'fulfillment_summary'  => $fulfillmentSummary,
-            'refund_summary'       => $refundSummary,
-            'balance_summary'      => $balanceSummary,
-            'recent_orders'        => $recentOrders,
-            'recent_listings'      => $recentListings,
-            'alerts'               => $alerts,
+            'seller' => $seller,
+            'summary' => $summary,
+            'recent_orders' => $recentOrders,
+            'recent_listings' => $recentListings,
+            'alerts' => $alerts,
         ],
-        'meta' => [
-            'api_version'  => 'v1',
-            'generated_at' => gmdate('Y-m-d H:i:s'),
-        ],
+        'meta' => bv_sd_meta(),
     ]);
-
-} catch (\Throwable $e) {
-    bv_seller_dashboard_log('Unhandled exception: '.$e->getMessage().' in '.$e->getFile().':'.$e->getLine());
-    bv_seller_dashboard_json(500,[
-        'ok'    => false,
-        'error' => ['code'=>'server_error','message'=>'Something went wrong.'],
-    ]);
+} catch (Throwable $e) {
+    bv_sd_log('Server error: ' . $e->getMessage());
+    bv_sd_error('server_error', 'An unexpected server error occurred.', 500);
 }
